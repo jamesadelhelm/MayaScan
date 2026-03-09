@@ -548,31 +548,46 @@ class Candidate:
     lon: float
     lat: float
     cluster_id: int = -1
-    dist_to_core_km: Optional[float] = None
+    dist_to_core_km: Optional[float] = None  # distance to densest candidate within the same cluster
     img_relpath: Optional[str] = None
 
 
 def _region_perimeter_pixels(region_mask: np.ndarray) -> float:
     """
-    Approximate perimeter as boundary-pixel count after 1-pixel erosion.
-    Good enough for compactness filtering on raster regions.
+    Estimate perimeter from exposed unit-length cell edges.
+    This is more stable than counting boundary pixels and avoids
+    artificially inflating compactness for small regions.
     """
     if region_mask.size == 0:
         return 0.0
-    eroded = binary_erosion(region_mask)
-    boundary = region_mask & ~eroded
-    return float(boundary.sum())
+    padded = np.pad(region_mask.astype(bool), 1, constant_values=False)
+    vertical = np.count_nonzero(padded[1:, :] != padded[:-1, :])
+    horizontal = np.count_nonzero(padded[:, 1:] != padded[:, :-1])
+    return float(vertical + horizontal)
 
 
 def _region_solidity(xs: np.ndarray, ys: np.ndarray) -> float:
     """
-    Solidity = area / convex_hull_area in raster pixel units.
+    Solidity = region area / convex hull area in raster pixel units.
+    Use pixel corners rather than pixel centers so the hull area reflects
+    the occupied raster cells instead of the center-point cloud.
     Values near 1 are compact/filled; lower values are fragmented/linear.
     """
     n = int(xs.size)
     if n < 3:
         return 1.0
-    pts = np.column_stack([xs.astype("float64"), ys.astype("float64")])
+    xs64 = xs.astype("float64")
+    ys64 = ys.astype("float64")
+    pts = np.concatenate(
+        [
+            np.column_stack([xs64, ys64]),
+            np.column_stack([xs64 + 1.0, ys64]),
+            np.column_stack([xs64, ys64 + 1.0]),
+            np.column_stack([xs64 + 1.0, ys64 + 1.0]),
+        ],
+        axis=0,
+    )
+    pts = np.unique(pts, axis=0)
     try:
         hull = ConvexHull(pts)
         hull_area_pix2 = float(hull.volume)  # 2D hull area
@@ -639,31 +654,56 @@ def _attach_region_density_stats(regions: List[Dict[str, Any]], labeled: np.ndar
 
 
 def _compute_primary_consensus_support(
+    primary_labeled: np.ndarray,
     primary_regions: List[Dict[str, Any]],
-    region_sets: List[List[Dict[str, Any]]],
+    other_runs: List[Tuple[np.ndarray, List[Dict[str, Any]]]],
     match_radius_pix: float,
 ) -> None:
     if not primary_regions:
         return
 
     r2 = float(max(0.0, match_radius_pix * match_radius_pix))
-    set_centers: List[np.ndarray] = []
-    for regs in region_sets:
-        if not regs:
-            set_centers.append(np.empty((0, 2), dtype="float64"))
-            continue
-        arr = np.array([[float(r["cx"]), float(r["cy"])] for r in regs], dtype="float64")
-        set_centers.append(arr)
+    pad = int(math.ceil(max(0.0, match_radius_pix)))
+    other_region_maps = [{int(r["rid"]): r for r in regs} for _, regs in other_runs]
 
     for r in primary_regions:
+        rid = int(r["rid"])
+        x0 = max(0, int(r["x0"]) - pad)
+        y0 = max(0, int(r["y0"]) - pad)
+        x1 = min(primary_labeled.shape[1] - 1, int(r["x1"]) + pad)
+        y1 = min(primary_labeled.shape[0] - 1, int(r["y1"]) + pad)
+        primary_mask = primary_labeled[y0 : y1 + 1, x0 : x1 + 1] == rid
+        primary_pix = int(primary_mask.sum())
         cx = float(r["cx"])
         cy = float(r["cy"])
-        support = 0
-        for centers in set_centers:
-            if centers.shape[0] == 0:
-                continue
-            d2 = (centers[:, 0] - cx) ** 2 + (centers[:, 1] - cy) ** 2
-            if float(np.min(d2)) <= r2:
+        support = 1
+
+        for (other_labeled, _), other_region_map in zip(other_runs, other_region_maps):
+            window = other_labeled[y0 : y1 + 1, x0 : x1 + 1]
+            cand_rids = np.unique(window[window > 0])
+            matched = False
+
+            for other_rid in cand_rids:
+                other_region = other_region_map.get(int(other_rid))
+                if other_region is None:
+                    continue
+
+                other_mask = window == int(other_rid)
+                overlap_pix = int(np.count_nonzero(primary_mask & other_mask))
+                if overlap_pix <= 0:
+                    continue
+
+                other_pix = max(1, int(other_region["pixels"]))
+                overlap_frac = float(overlap_pix) / float(min(primary_pix, other_pix))
+                d2 = (float(other_region["cx"]) - cx) ** 2 + (float(other_region["cy"]) - cy) ** 2
+
+                # Require real raster overlap; center distance only guards against
+                # large merged regions being treated as a match too loosely.
+                if overlap_frac >= 0.05 and (d2 <= r2 or overlap_frac >= 0.25):
+                    matched = True
+                    break
+
+            if matched:
                 support += 1
         r["consensus_support"] = int(support)
 
@@ -829,8 +869,13 @@ def detect_candidates(
 
     if len(runs) > 1 and params.consensus_enabled and params.consensus_min_support > 1:
         radius_pix = float(max(0.0, params.consensus_match_radius_m) / max(1e-9, res_m))
-        region_sets = [rset for _, _, rset, _, _ in runs]
-        _compute_primary_consensus_support(regions, region_sets, match_radius_pix=radius_pix)
+        other_runs = [(labeled_i, regions_i) for i, (_, labeled_i, regions_i, _, _) in enumerate(runs) if i != primary_idx]
+        _compute_primary_consensus_support(
+            primary_labeled=labeled,
+            primary_regions=regions,
+            other_runs=other_runs,
+            match_radius_pix=radius_pix,
+        )
         before = len(regions)
         regions = [r for r in regions if int(r.get("consensus_support", 0)) >= int(params.consensus_min_support)]
         kept_rids = [int(r["rid"]) for r in regions]
@@ -874,9 +919,19 @@ def _auto_dbscan_eps(coords_m: np.ndarray, min_samples: int) -> float:
     nn = NearestNeighbors(n_neighbors=min(k + 1, coords_m.shape[0]))
     nn.fit(coords_m)
     dists, _ = nn.kneighbors(coords_m)
-    kth = dists[:, -1]
-    eps = float(np.percentile(kth, 85))
-    return float(np.clip(eps, 60.0, 300.0))
+    kth = np.sort(dists[:, -1].astype("float64"))
+
+    fallback = float(np.percentile(kth, 80))
+    if kth.size < 4 or not np.all(np.isfinite(kth)) or float(kth[-1]) <= float(kth[0]):
+        return float(np.clip(fallback, 40.0, 250.0))
+
+    x = np.linspace(0.0, 1.0, kth.size)
+    y = (kth - kth[0]) / max(1e-9, float(kth[-1] - kth[0]))
+    knee_idx = int(np.argmax(y - x))
+    eps = float(kth[knee_idx])
+    if knee_idx <= 0 or knee_idx >= kth.size - 1:
+        eps = fallback
+    return float(np.clip(eps, 40.0, 250.0))
 
 
 def _utm_epsg_from_lonlat(lon: float, lat: float) -> int:
@@ -1020,6 +1075,40 @@ def cluster_candidates_meters(xs_m: np.ndarray, ys_m: np.ndarray, params: Params
     for i, lab in enumerate(labels):
         out[i] = mapping.get(lab, -1)
     return out.astype(int)
+
+
+def assign_cluster_core_distances(candidates: List[Candidate], xs_m: np.ndarray, ys_m: np.ndarray) -> None:
+    """
+    Compute distance to the densest candidate within the same cluster.
+    Noise candidates do not get a cluster-core distance.
+    """
+    if not candidates:
+        return
+
+    cluster_to_core_idx: Dict[int, int] = {}
+    for idx, cand in enumerate(candidates):
+        cid = int(cand.cluster_id)
+        if cid == -1:
+            continue
+        cur = cluster_to_core_idx.get(cid)
+        if cur is None:
+            cluster_to_core_idx[cid] = idx
+            continue
+        if (cand.density, cand.score) > (candidates[cur].density, candidates[cur].score):
+            cluster_to_core_idx[cid] = idx
+
+    for idx, cand in enumerate(candidates):
+        cid = int(cand.cluster_id)
+        if cid == -1:
+            cand.dist_to_core_km = None
+            continue
+        core_idx = cluster_to_core_idx.get(cid)
+        if core_idx is None:
+            cand.dist_to_core_km = None
+            continue
+        dx = float(xs_m[idx] - xs_m[core_idx])
+        dy = float(ys_m[idx] - ys_m[core_idx])
+        cand.dist_to_core_km = float(math.hypot(dx, dy) / 1000.0)
 
 
 # -----------------------------
@@ -2253,12 +2342,7 @@ def main() -> None:
         for c, lab in zip(candidates, labels):
             c.cluster_id = int(lab)
 
-        core_idx = int(np.argmax([c.density for c in candidates]))
-        core_x, core_y = xs_m[core_idx], ys_m[core_idx]
-        for i, c in enumerate(candidates):
-            dx = xs_m[i] - core_x
-            dy = ys_m[i] - core_y
-            c.dist_to_core_km = float(math.sqrt(dx * dx + dy * dy) / 1000.0)
+        assign_cluster_core_distances(candidates, xs_m, ys_m)
 
         n_clusters = len({c.cluster_id for c in candidates if c.cluster_id != -1})
         LOG.info("Clusters found: %d (noise=%d)", n_clusters, sum(1 for c in candidates if c.cluster_id == -1))
