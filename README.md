@@ -24,7 +24,7 @@ MayaScan is designed for triage, not confirmation. It highlights terrain anomali
 
 - Converts LAZ/LAS input into DTM, LRM, and density rasters
 - Detects region-level candidate features instead of relying on centroid-only logic
-- Supports multi-threshold consensus to reduce one-threshold artifacts
+- Supports overlap-aware multi-threshold consensus to reduce one-threshold artifacts
 - Scores candidates with interpretable components such as density, relief, prominence, compactness, solidity, and area
 - Uses DBSCAN to group candidates into possible settlement patterns
 - Exports CSV, GeoJSON, KML, Markdown, PDF, and HTML outputs
@@ -168,11 +168,11 @@ python maya_scan.py \
 1. **Ground model**: PDAL converts the point cloud into a DTM raster. Optional SMRF classification can be applied first.
 2. **Local relief model**: MayaScan computes a multi-scale LRM by subtracting a broader smoothed surface from a finer one.
 3. **Region detection**: connected positive-relief regions are extracted and cleaned up morphologically.
-4. **Consensus support**: optional multi-threshold runs match regions across percentile thresholds and keep candidates with enough support.
+4. **Consensus support**: optional multi-threshold runs match regions across percentile thresholds using raster overlap, with centroid distance as a secondary guard, and keep candidates with enough support.
 5. **Region metrics**: each candidate region gets area, peak relief, prominence, extent, aspect ratio, compactness, solidity, and size metrics.
 6. **Density modeling**: a smoothed feature-density surface is built and sampled at the region level.
 7. **Post-filtering**: regions are filtered by density, shape, slope, edge proximity, and spacing to reduce noise and duplicates.
-8. **Scoring and clustering**: remaining candidates are ranked and clustered with DBSCAN to help identify broader settlement structure.
+8. **Scoring and clustering**: remaining candidates are ranked, clustered with DBSCAN, and annotated with distance to the densest member of their assigned cluster.
 9. **Reporting**: the pipeline writes GIS exports, plots, reports, and run metadata for reproducibility.
 
 ## Key Parameters
@@ -193,9 +193,9 @@ python maya_scan.py \
 - `--consensus-percentiles 95,96,97`
   Runs candidate extraction at multiple thresholds.
 - `--consensus-min-support 2`
-  Requires a region to appear in more than one thresholded run.
+  Requires support from at least this many thresholded runs, including the primary run.
 - `--consensus-radius-m 12`
-  Sets the matching distance used when counting cross-threshold support.
+  Sets the centroid-distance guard used when counting cross-threshold support; matches still require real raster overlap.
 - `--no-consensus`
   Disables consensus filtering entirely.
 
@@ -213,7 +213,7 @@ python maya_scan.py \
 ### Clustering and reporting
 
 - `--cluster-eps auto`
-  Uses automatic or fixed DBSCAN radius in meters.
+  Uses automatic or fixed DBSCAN radius in meters. `auto` estimates eps from the k-distance knee with a percentile fallback.
 - `--min-samples`
   Sets the minimum candidates needed to form a cluster.
 - `--report-top-n`, `--label-top-n`
@@ -233,6 +233,8 @@ Each run writes a folder under `runs/<run_name>/`. Common outputs include:
 - `candidate_labels.csv` when analyst labeling is used
 
 The Streamlit app can also prepare a ZIP archive of run outputs. Across runs, MayaScan appends summary information to `runs/manifest.csv`.
+
+Candidate exports include clustering fields such as `cluster_id` and `dist_to_core_km`, where `dist_to_core_km` is the distance to the densest candidate within the same cluster.
 
 ## Scoring and Run Quality
 
@@ -331,9 +333,10 @@ This project is licensed under the MIT License. See `LICENSE` for details.
 
 ## Author
 
-**James Adelhelm**
+**James Adelhelm**  
+Software Developer on the Data Ingest team at AccuWeather.
 
-Independent personal research and software project. MayaScan is not affiliated with AccuWeather.
+MayaScan is an independent personal research and software project driven by an interest in Maya history. It is not affiliated with, endorsed by, or sponsored by AccuWeather.
 
 ## Image Credits
 
