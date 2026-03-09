@@ -329,7 +329,7 @@ Large language models were used for prototyping, debugging support, and document
 
 ## License
 
-This project is licensed under the MIT License. See `LICENSE` for details.
+This project is licensed under the MIT License. See [`LICENSE`](LICENSE) for details.
 
 ## Author
 
