@@ -2,26 +2,24 @@
 """
 maya_scan.py
 
-One-file Maya LiDAR pipeline:
-- LAZ/LAS -> DTM (PDAL) (GeoTIFF)
-- DTM -> multi-scale Local Relief Model (LRM) (multi-sigma, pixel-based)
-- LRM -> candidate structures (connected components + terrain filters)
+One-file LiDAR terrain-anomaly pipeline:
+- LAZ/LAS -> DTM (PDAL) GeoTIFF
+- DTM -> multi-scale Local Relief Model (LRM)
+- LRM -> candidate regions (connected components + terrain filters)
+- optional multi-threshold consensus filtering with overlap-aware region matching
 - candidates -> density raster + scores
-- candidates -> clustering (DBSCAN; eps can be auto-chosen) **in meters** (auto-UTM if needed)
-- exports: CSV, GeoJSON, KML (labels only top-N; rest unlabeled)
-- plots + Markdown + optional PDF report
-- HTML report w/ Leaflet map + candidate cutout panels (LRM + hillshade)
+- candidates -> DBSCAN clustering in meters (auto eps supported; auto-UTM if needed)
+- exports: CSV, GeoJSON, KML, Markdown, HTML, and optional PDF
+- candidate exports include cluster_id and dist_to_core_km
 
 Project-goal improvements:
-- Region shape metrics: bbox fill "extent" (area / bbox_area), aspect ratio, width/height (m)
-- Post-filters: min_peak, min_area_m2, min_extent, max_aspect, edge buffer, min spacing, min_prominence, min_compactness, min_solidity
-- Score supports extent/prominence/compactness/solidity terms
-- Extra plots: extent/aspect/compactness/solidity/prominence histograms
-- Safer out_dir: only delete existing run with --overwrite
+- region shape metrics: extent, aspect ratio, width/height, compactness, solidity
+- post-filters for peak, area, slope, spacing, prominence, compactness, and solidity
+- extra diagnostic plots and safer output overwrite behavior
 
 Dependencies:
-- Required: PDAL (system install), numpy, scipy, rasterio, pyproj, matplotlib
-- Optional: scikit-learn (DBSCAN clustering), reportlab (PDF report)
+- Required: PDAL, numpy, scipy, rasterio, pyproj, matplotlib
+- Optional: scikit-learn (DBSCAN), reportlab (PDF)
 
 Responsible use:
 - Output coordinates can correspond to sensitive locations. Handle responsibly.
