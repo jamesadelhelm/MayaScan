@@ -57,6 +57,7 @@ import html
 import json
 import logging
 import math
+import os
 import time
 import re
 import shutil
@@ -114,6 +115,30 @@ def setup_logging(out_dir: Path) -> None:
     LOG.addHandler(ch)
     LOG.addHandler(fh)
     LOG.info("Logging to %s", log_path)
+
+
+def configure_runtime_cache_dirs(out_dir: Path) -> None:
+    """
+    Keep plotting/font caches inside the runs directory.
+
+    Some execution environments have a read-only or non-writable home cache.
+    Matplotlib/fontconfig can otherwise spend a long time trying to build
+    caches there, or fail during plot/report generation.
+    """
+    cache_root = out_dir.parent / ".mayascan_cache"
+    mpl_cache = cache_root / "matplotlib"
+    xdg_cache = cache_root / "xdg"
+    for path in (mpl_cache, xdg_cache):
+        path.mkdir(parents=True, exist_ok=True)
+
+    os.environ.setdefault("MPLCONFIGDIR", str(mpl_cache))
+    os.environ.setdefault("XDG_CACHE_HOME", str(xdg_cache))
+
+    LOG.info(
+        "Runtime cache dirs: MPLCONFIGDIR=%s | XDG_CACHE_HOME=%s",
+        os.environ["MPLCONFIGDIR"],
+        os.environ["XDG_CACHE_HOME"],
+    )
 
 
 def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> None:
@@ -196,6 +221,17 @@ class Params:
     score_solidity_exp: float = 0.20
     score_area_exp: float = 0.50
 
+
+# Floor values used in score computation to prevent zero/negative inputs to
+# power operations. Kept as named constants so the intent is self-documenting.
+_SCORE_FLOOR_DENSITY: float = 1e-9
+_SCORE_FLOOR_PEAK: float = 1e-9
+_SCORE_FLOOR_EXTENT: float = 1e-6
+_SCORE_FLOOR_CONSENSUS: float = 1.0
+_SCORE_FLOOR_PROMINENCE: float = 1e-6
+_SCORE_FLOOR_COMPACTNESS: float = 1e-6
+_SCORE_FLOOR_SOLIDITY: float = 1e-6
+_SCORE_FLOOR_AREA: float = 1e-9
 
 _RUN_NAME_BAD_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _AUTO_PERCENTILE_RE = re.compile(r"^auto:p([0-9]+(?:\.[0-9]+)?)$", re.IGNORECASE)
@@ -823,7 +859,10 @@ def build_density_from_regions(
     density = gaussian_filter(mound_binary, sigma=float(params.density_sigma_pix)).astype("float32")
     dmin = float(np.min(density))
     dmax = float(np.max(density))
-    density_norm = ((density - dmin) / (dmax - dmin + 1e-9)).astype("float32")
+    if np.isclose(dmin, dmax):
+        density_norm = np.ones_like(density, dtype="float32")
+    else:
+        density_norm = ((density - dmin) / (dmax - dmin)).astype("float32")
 
     write_float_geotiff(out_density_tif, density_norm, profile)
     LOG.info("Wrote density raster: %s", out_density_tif)
@@ -1047,7 +1086,9 @@ def dedupe_candidates_by_spacing(
 
 def cluster_candidates_meters(xs_m: np.ndarray, ys_m: np.ndarray, params: Params) -> np.ndarray:
     if DBSCAN is None:
-        LOG.warning("sklearn not installed; clustering disabled (cluster_id=-1).")
+        msg = "sklearn not installed; clustering disabled (cluster_id=-1)."
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
         return np.full(xs_m.shape[0], -1, dtype=int)
 
     coords = np.column_stack([xs_m, ys_m]).astype("float32")
@@ -1215,7 +1256,7 @@ def write_clusters_csv(candidates: List[Candidate], out_path: Path) -> None:
 
 
 def _kml_escape(s: str) -> str:
-    return s.replace("&", "and").replace("<", "(").replace(">", ")")
+    return html.escape(s)
 
 
 def write_kml(candidates: List[Candidate], out_path: Path, label_top_n: int) -> None:
@@ -1287,6 +1328,9 @@ def write_kml(candidates: List[Candidate], out_path: Path, label_top_n: int) -> 
 # Plots + report
 # -----------------------------
 def make_plots(out_dir: Path, lrm: np.ndarray, density: np.ndarray, candidates: List[Candidate]) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
     plots_dir = out_dir / "plots"
@@ -1521,7 +1565,9 @@ def write_report_md(
 
 def write_report_pdf(md_path: Path, pdf_path: Path) -> None:
     if canvas is None:
-        LOG.warning("reportlab not installed; skipping PDF report.")
+        msg = "reportlab not installed; skipping PDF report."
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
         return
 
     text = md_path.read_text(encoding="utf-8").splitlines()
@@ -1632,6 +1678,9 @@ def generate_candidate_panels(
     top_n: int,
     res_m: float,
 ) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
     img_dir = out_dir / "html" / "img"
@@ -2148,6 +2197,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     setup_logging(out_dir)
+    configure_runtime_cache_dirs(out_dir)
     pdal_ver = pdal_version()
     LOG.info("PDAL detected: %s", pdal_ver)
     run_t0 = time.perf_counter()
@@ -2230,7 +2280,10 @@ def main() -> None:
             y0 = int(r.get("y0", 0))
             x1 = int(r.get("x1", W - 1))
             y1 = int(r.get("y1", H - 1))
-            if x0 <= edge_buffer_pix or y0 <= edge_buffer_pix or x1 >= (W - 1 - edge_buffer_pix) or y1 >= (H - 1 - edge_buffer_pix):
+            # Strict inequalities: a bbox touching exactly the buffer boundary is
+            # kept; only bboxes whose extent reaches into the buffer zone are dropped.
+            # Using <= / >= would exclude one extra pixel layer beyond edge_buffer_m.
+            if x0 < edge_buffer_pix or y0 < edge_buffer_pix or x1 > (W - 1 - edge_buffer_pix) or y1 > (H - 1 - edge_buffer_pix):
                 dropped_edge += 1
                 continue
 
@@ -2266,14 +2319,14 @@ def main() -> None:
             continue
 
         score = (
-            (dens ** params.score_density_exp)
-            * (max(1e-9, peak) ** params.score_peak_exp)
-            * ((max(1e-6, extent)) ** params.score_extent_exp)
-            * ((max(1.0, float(consensus_support))) ** params.score_consensus_exp)
-            * ((max(1e-6, prominence)) ** params.score_prominence_exp)
-            * ((max(1e-6, compactness)) ** params.score_compactness_exp)
-            * ((max(1e-6, solidity)) ** params.score_solidity_exp)
-            * (max(1e-9, area_m2) ** params.score_area_exp)
+            (max(_SCORE_FLOOR_DENSITY, dens) ** params.score_density_exp)
+            * (max(_SCORE_FLOOR_PEAK, peak) ** params.score_peak_exp)
+            * (max(_SCORE_FLOOR_EXTENT, extent) ** params.score_extent_exp)
+            * (max(_SCORE_FLOOR_CONSENSUS, float(consensus_support)) ** params.score_consensus_exp)
+            * (max(_SCORE_FLOOR_PROMINENCE, prominence) ** params.score_prominence_exp)
+            * (max(_SCORE_FLOOR_COMPACTNESS, compactness) ** params.score_compactness_exp)
+            * (max(_SCORE_FLOOR_SOLIDITY, solidity) ** params.score_solidity_exp)
+            * (max(_SCORE_FLOOR_AREA, area_m2) ** params.score_area_exp)
         )
 
         x_map, y_map = pix2map_xy(dtm_transform, r["cy"], r["cx"])
@@ -2388,20 +2441,21 @@ def main() -> None:
         LOG.info("Wrote report.pdf: %s", report_pdf)
     stage_metrics["step6_reports_sec"] = float(time.perf_counter() - step_t0)
 
-    if params.html_report and candidates:
+    if params.html_report:
         cutout_top_n = params.report_top_n if args.cutout_top_n is None else int(args.cutout_top_n)
         LOG.info("Step 7: Generating HTML report + cutouts")
         step_t0 = time.perf_counter()
-        generate_candidate_panels(
-            out_dir=out_dir,
-            run_name=run_name,
-            dtm=dtm,
-            lrm=lrm,
-            params=params,
-            candidates=candidates,
-            top_n=cutout_top_n,
-            res_m=float(res_m),
-        )
+        if candidates:
+            generate_candidate_panels(
+                out_dir=out_dir,
+                run_name=run_name,
+                dtm=dtm,
+                lrm=lrm,
+                params=params,
+                candidates=candidates,
+                top_n=cutout_top_n,
+                res_m=float(res_m),
+            )
         html_out = write_html_report(
             out_dir=out_dir,
             run_name=run_name,
