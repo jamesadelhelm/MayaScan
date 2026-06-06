@@ -204,6 +204,7 @@ class Params:
     min_prominence_m: float = 0.10         # region mean relief - local ring mean relief
     min_compactness: float = 0.12          # 4*pi*A/P^2 in [0,1], lower = line-like
     min_solidity: float = 0.50             # A / convex_hull_A in [0,1], lower = fragmented/linear
+    max_peak_offset_ratio: float = 0.0    # 0 disables; ~0.65 removes edge-peaked ridges/tree-throw
 
     # Clustering
     cluster_eps_m: float = 150.0
@@ -691,6 +692,7 @@ class Candidate:
     prominence_m: float        # mean relief over region minus local ring mean
     compactness: float         # 4*pi*A/P^2 in [0,1]
     solidity: float            # A / convex_hull_A in [0,1]
+    peak_offset_ratio: float   # dist(centroid, peak_pixel) / sqrt(area_pix); low = dome-like
     width_m: float
     height_m: float
     score: float
@@ -905,8 +907,20 @@ def _extract_candidate_regions(
         if slope_q75_deg > params.max_slope_deg:
             continue
 
-        peak = float(np.nanmax(lrm[region]))
-        mean = float(np.nanmean(lrm[region]))
+        region_lrm_vals = lrm[ys, xs]
+        peak = float(np.nanmax(region_lrm_vals))
+        mean = float(np.nanmean(region_lrm_vals))
+
+        # Peak centrality: distance from centroid to the LRM-peak pixel,
+        # normalized by sqrt(area_pixels).  Values near 0 indicate a dome-
+        # like mound; values approaching 1+ suggest the peak is at the edge
+        # (a ridge segment, tree-throw cluster, or elongated false positive).
+        peak_local_idx = int(np.nanargmax(region_lrm_vals))
+        peak_col = float(xs[peak_local_idx])
+        peak_row = float(ys[peak_local_idx])
+        peak_offset_ratio = float(
+            math.hypot(peak_col - cx, peak_row - cy) / max(1.0, math.sqrt(float(pix)))
+        )
         ring_iters = max(1, int(params.prominence_ring_pixels))
         ring_mask = binary_dilation(region, iterations=ring_iters) & ~region
         ring_vals = lrm[ring_mask]
@@ -960,6 +974,7 @@ def _extract_candidate_regions(
                 "slope_median_deg": slope_median_deg,
                 "slope_q75_deg": slope_q75_deg,
                 "slope_max_deg": slope_max_deg,
+                "peak_offset_ratio": peak_offset_ratio,
             }
         )
         kept_rids.append(rid)
@@ -1339,6 +1354,7 @@ def write_geojson(candidates: List[Candidate], out_path: Path) -> None:
                     "prominence_m": c.prominence_m,
                     "compactness": c.compactness,
                     "solidity": c.solidity,
+                    "peak_offset_ratio": c.peak_offset_ratio,
                     "width_m": c.width_m,
                     "height_m": c.height_m,
                     "cluster_id": c.cluster_id,
@@ -1398,6 +1414,7 @@ def write_regions_geojson(
                     "aspect": c.aspect,
                     "compactness": c.compactness,
                     "solidity": c.solidity,
+                    "peak_offset_ratio": c.peak_offset_ratio,
                     "prominence_m": c.prominence_m,
                     "consensus_support": c.consensus_support,
                     "cluster_id": c.cluster_id,
@@ -1429,6 +1446,7 @@ def write_csv(candidates: List[Candidate], out_path: Path) -> None:
                 "prominence_m",
                 "compactness",
                 "solidity",
+                "peak_offset_ratio",
                 "width_m",
                 "height_m",
                 "lon",
@@ -1452,6 +1470,7 @@ def write_csv(candidates: List[Candidate], out_path: Path) -> None:
                     f"{c.prominence_m:.4f}",
                     f"{c.compactness:.4f}",
                     f"{c.solidity:.4f}",
+                    f"{c.peak_offset_ratio:.4f}",
                     f"{c.width_m:.2f}",
                     f"{c.height_m:.2f}",
                     f"{c.lon:.8f}",
@@ -1783,7 +1802,7 @@ def write_report_md(
     md.append("- Slope filter uses **region slope q75** (not centroid slope).")
     md.append("- Candidate density uses **region mean density** over each connected region.")
     md.append("- Clustering/distances are done in **meters** (auto-UTM if source CRS is geographic).")
-    md.append("- KML ‘All Candidates’ dots have label scale=0 to prevent Google Earth text overload.")
+    md.append("- KML 'All Candidates' dots have label scale=0 to prevent Google Earth text overload.")
     md.append("")
 
     out_path = out_dir / "report.md"
@@ -1995,6 +2014,7 @@ def write_html_report(
     params: Params,
     pos_thresh: float,
     min_density: float,
+    validation_results: Optional[Dict[str, Any]] = None,
 ) -> Path:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -2036,6 +2056,20 @@ def write_html_report(
 
     html_path = out_dir / "report.html"
     s_points = json.dumps(points)
+
+    # Serialize known-site data for Leaflet overlay
+    known_site_js: List[Dict[str, Any]] = []
+    if validation_results:
+        for s in validation_results.get("per_site", []):
+            known_site_js.append({
+                "name": s["name"],
+                "lat": s["lat"],
+                "lon": s["lon"],
+                "hit": s["hit"],
+                "matched_rank": s.get("matched_rank"),
+                "dist_m": s.get("dist_m"),
+            })
+    s_known = json.dumps(known_site_js)
 
     doc = f"""<!doctype html>
 <html><head><meta charset='utf-8'/>
@@ -2303,12 +2337,223 @@ points.forEach(p => {{
 if (bounds.length > 0) {{
   map.fitBounds(bounds, {{padding:[20,20]}});
 }}
-</script>
 
-</div></body></html>
+// Known-site markers (from --validate-against)
+const knownSites = {s_known};
+knownSites.forEach(s => {{
+  const col = s.hit ? '#16a34a' : '#dc2626';
+  const label = s.hit
+    ? `<b>${{s.name}}</b><br/>✓ Hit — rank ${{s.matched_rank}}, ${{s.dist_m}}m away`
+    : `<b>${{s.name}}</b><br/>✗ Not matched within radius`;
+  L.circleMarker([s.lat, s.lon], {{
+    radius: 8,
+    color: col,
+    weight: 2.5,
+    fillColor: col,
+    fillOpacity: 0.25,
+    dashArray: '4,3',
+  }}).addTo(map).bindPopup(`<div style="font-size:13px">${{label}}</div>`);
+}});
+</script>
 """
+
+    # Validation results section
+    if validation_results:
+        vr = validation_results
+        recall_pct = float(vr["recall"]) * 100.0
+        badge_color = "#16a34a" if recall_pct >= 70 else "#d97706" if recall_pct >= 40 else "#dc2626"
+        doc += f"""
+<div class='hr'></div>
+<h2>Validation results</h2>
+<div class='small' style='margin-bottom:10px'>
+  Known-site locations loaded from <code>--validate-against</code>.
+  A candidate within <b>{vr['match_radius_m']:.0f} m</b> of a site counts as a hit.
+  Green/red dashed circles on the map show hit/miss status.
+</div>
+<div class='kpis' style='grid-template-columns:repeat(5,minmax(0,1fr))'>
+  <div class='kpi'><span class='k'>Known sites</span><span class='v'>{vr['known_sites']}</span></div>
+  <div class='kpi'><span class='k'>Hits</span><span class='v' style='color:{badge_color}'>{vr['hits']}</span></div>
+  <div class='kpi'><span class='k'>Recall</span><span class='v' style='color:{badge_color}'>{recall_pct:.1f}%</span></div>
+  <div class='kpi'><span class='k'>Mean hit rank</span><span class='v'>{vr['mean_rank_of_hits'] or '—'}</span></div>
+  <div class='kpi'><span class='k'>Median hit rank</span><span class='v'>{vr['median_rank_of_hits'] or '—'}</span></div>
+</div>
+<div style='margin-top:10px' class='small'>
+  Hits in top-10: <b>{vr.get('hits_top_10', 0)}</b> &nbsp;|&nbsp;
+  top-25: <b>{vr.get('hits_top_25', 0)}</b> &nbsp;|&nbsp;
+  top-50: <b>{vr.get('hits_top_50', 0)}</b> &nbsp;|&nbsp;
+  top-100: <b>{vr.get('hits_top_100', 0)}</b>
+</div>
+<details class='card' style='margin-top:14px'>
+  <summary>Per-site match table</summary>
+  <div style='max-height:400px;overflow:auto;margin-top:8px'>
+  <table>
+  <thead><tr><th>site</th><th>hit</th><th>rank</th><th>dist (m)</th><th>score</th><th>lat</th><th>lon</th></tr></thead>
+  <tbody>
+"""
+        for s in vr.get("per_site", []):
+            hit_str = "✓" if s["hit"] else "✗"
+            hit_color = "#16a34a" if s["hit"] else "#dc2626"
+            doc += (
+                f"<tr>"
+                f"<td>{html.escape(str(s['name']))}</td>"
+                f"<td style='color:{hit_color};font-weight:600'>{hit_str}</td>"
+                f"<td>{s['matched_rank'] or '—'}</td>"
+                f"<td>{s['dist_m'] if s['dist_m'] is not None else '—'}</td>"
+                f"<td>{s['matched_score'] or '—'}</td>"
+                f"<td>{s['lat']:.6f}</td>"
+                f"<td>{s['lon']:.6f}</td>"
+                f"</tr>\n"
+            )
+        doc += "</tbody></table></div></details>\n"
+
+    doc += "\n</div></body></html>\n"
     html_path.write_text(doc, encoding="utf-8")
     return html_path
+
+
+# -----------------------------
+# Validation framework
+# -----------------------------
+def load_known_sites(path: Path) -> List[Dict[str, Any]]:
+    """
+    Load known archaeological site locations from a CSV or GeoJSON file.
+
+    CSV format (minimum columns required: lat, lon; name is optional):
+        name,lat,lon
+        Structure A,17.123,-89.456
+
+    GeoJSON format: FeatureCollection of Point features.  The 'name'
+    property (or 'id') is used as the site label if present.
+
+    Returns a list of dicts with keys: name (str), lat (float), lon (float).
+    """
+    suffix = path.suffix.lower()
+    sites: List[Dict[str, Any]] = []
+
+    if suffix == ".geojson" or suffix == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        features = data.get("features", [])
+        for i, feat in enumerate(features):
+            geom = feat.get("geometry", {})
+            if geom.get("type") != "Point":
+                continue
+            coords = geom.get("coordinates", [])
+            if len(coords) < 2:
+                continue
+            lon_s, lat_s = float(coords[0]), float(coords[1])
+            props = feat.get("properties") or {}
+            name = str(props.get("name") or props.get("id") or props.get("Name") or f"site_{i+1}")
+            sites.append({"name": name, "lat": lat_s, "lon": lon_s})
+    else:
+        import csv as _csv
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            if reader.fieldnames is None:
+                raise ValueError(f"Empty or header-less CSV: {path}")
+            fields_lower = [h.lower().strip() for h in reader.fieldnames]
+            if "lat" not in fields_lower or "lon" not in fields_lower:
+                raise ValueError(
+                    f"Validation CSV must have 'lat' and 'lon' columns. Found: {list(reader.fieldnames)}"
+                )
+            lat_col = reader.fieldnames[fields_lower.index("lat")]
+            lon_col = reader.fieldnames[fields_lower.index("lon")]
+            name_col = None
+            for candidate_name in ("name", "Name", "NAME", "site", "id"):
+                if candidate_name in reader.fieldnames:
+                    name_col = candidate_name
+                    break
+            for i, row in enumerate(reader):
+                try:
+                    lat_s = float(row[lat_col])
+                    lon_s = float(row[lon_col])
+                except (TypeError, ValueError):
+                    continue
+                name = str(row[name_col]) if name_col and row.get(name_col) else f"site_{i+1}"
+                sites.append({"name": name, "lat": lat_s, "lon": lon_s})
+
+    return sites
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in meters between two WGS84 points."""
+    R = 6_371_000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return 2.0 * R * math.asin(min(1.0, math.sqrt(a)))
+
+
+def validate_candidates(
+    candidates: List[Candidate],
+    known_sites: List[Dict[str, Any]],
+    match_radius_m: float,
+) -> Dict[str, Any]:
+    """
+    For each known site, find the closest candidate within match_radius_m.
+    Returns a dict with hit-rate metrics and per-site results.
+    """
+    sorted_c = sorted(candidates, key=lambda c: c.score, reverse=True)
+    rank_map = {c.cand_id: (rank + 1) for rank, c in enumerate(sorted_c)}
+
+    per_site: List[Dict[str, Any]] = []
+    hits_by_rank: Dict[int, int] = {}
+
+    for site in known_sites:
+        slat, slon = float(site["lat"]), float(site["lon"])
+        best_dist = float("inf")
+        best_cand = None
+        for c in candidates:
+            d = _haversine_m(slat, slon, c.lat, c.lon)
+            if d < best_dist:
+                best_dist = d
+                best_cand = c
+
+        hit = best_cand is not None and best_dist <= match_radius_m
+        rank = rank_map.get(best_cand.cand_id) if best_cand else None
+        per_site.append(
+            {
+                "name": site["name"],
+                "lat": slat,
+                "lon": slon,
+                "hit": hit,
+                "matched_cand_id": best_cand.cand_id if best_cand and hit else None,
+                "matched_rank": rank if hit else None,
+                "dist_m": round(best_dist, 1) if best_cand else None,
+                "matched_score": round(best_cand.score, 4) if best_cand and hit else None,
+            }
+        )
+        if hit and rank is not None:
+            hits_by_rank[rank] = hits_by_rank.get(rank, 0) + 1
+
+    n_sites = len(known_sites)
+    n_hits = sum(1 for s in per_site if s["hit"])
+    recall = float(n_hits) / max(1, n_sites)
+
+    hit_ranks = [s["matched_rank"] for s in per_site if s["hit"] and s["matched_rank"] is not None]
+    mean_rank = float(sum(hit_ranks)) / len(hit_ranks) if hit_ranks else None
+    median_rank = float(sorted(hit_ranks)[len(hit_ranks) // 2]) if hit_ranks else None
+
+    cutoffs = [10, 25, 50, 100]
+    hits_at = {}
+    for k in cutoffs:
+        hits_at[f"hits_top_{k}"] = sum(1 for r in hit_ranks if r <= k) if hit_ranks else 0
+
+    return {
+        "known_sites": n_sites,
+        "hits": n_hits,
+        "recall": round(recall, 4),
+        "match_radius_m": match_radius_m,
+        "mean_rank_of_hits": round(mean_rank, 1) if mean_rank is not None else None,
+        "median_rank_of_hits": median_rank,
+        "total_candidates": len(candidates),
+        **hits_at,
+        "per_site": per_site,
+    }
+
+
+def write_validation_json(results: Dict[str, Any], out_path: Path) -> None:
+    out_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
 
 
 # -----------------------------
@@ -2366,6 +2611,7 @@ def main() -> None:
     ap.add_argument("--min-prominence", type=_arg_nonnegative_float, default=None, help="Min local prominence (m) post-filter (default 0.10)")
     ap.add_argument("--min-compactness", type=_arg_unit_interval, default=None, help="Min compactness 4*pi*A/P^2 (0..1), lower removes line-like shapes")
     ap.add_argument("--min-solidity", type=_arg_unit_interval, default=None, help="Min solidity area/convex_hull_area (0..1), lower removes fragmented/linear shapes")
+    ap.add_argument("--max-peak-offset", type=_arg_nonnegative_float, default=None, help="Max peak_offset_ratio (0=disabled); ~0.65 removes edge-peaked ridges and tree-throw clusters")
 
     # scoring knobs
     ap.add_argument("--score-extent-exp", type=_arg_nonnegative_float, default=None, help="Exponent for extent in score (default 0.35)")
@@ -2384,6 +2630,19 @@ def main() -> None:
 
     # HTML / cutouts
     ap.add_argument("--no-html", action="store_true", help="Disable HTML report + cutout images")
+
+    # Validation
+    ap.add_argument(
+        "--validate-against",
+        default=None,
+        help="Path to CSV (lat,lon,name) or GeoJSON of known archaeological sites for hit-rate validation",
+    )
+    ap.add_argument(
+        "--validate-match-radius-m",
+        type=_arg_positive_float,
+        default=25.0,
+        help="Radius in meters: a candidate within this distance of a known site counts as a hit (default 25)",
+    )
     ap.add_argument("--cutout-size-m", type=_arg_positive_float, default=None, help="Cutout panel window size in meters (default 140)")
     ap.add_argument("--cutout-top-n", type=_arg_nonnegative_int, default=None, help="How many top candidates get cutouts (default report_top_n)")
 
@@ -2450,6 +2709,8 @@ def main() -> None:
         params.min_compactness = args.min_compactness
     if args.min_solidity is not None:
         params.min_solidity = args.min_solidity
+    if args.max_peak_offset is not None:
+        params.max_peak_offset_ratio = args.max_peak_offset
 
     if args.score_extent_exp is not None:
         params.score_extent_exp = args.score_extent_exp
@@ -2631,8 +2892,9 @@ def main() -> None:
         prominence = float(r.get("prominence_m", 0.0))
         compactness = float(r.get("compactness", 0.0))
         solidity = float(r.get("solidity", 0.0))
+        peak_offset_ratio = float(r.get("peak_offset_ratio", 0.0))
 
-        # post-filters for “project goal”
+        # post-filters for "project goal"
         if (
             peak < params.min_peak_relief_m
             or area_m2 < params.min_area_m2
@@ -2642,6 +2904,7 @@ def main() -> None:
             or prominence < params.min_prominence_m
             or compactness < params.min_compactness
             or solidity < params.min_solidity
+            or (params.max_peak_offset_ratio > 0.0 and peak_offset_ratio > params.max_peak_offset_ratio)
         ):
             dropped_post += 1
             continue
@@ -2675,6 +2938,7 @@ def main() -> None:
                 prominence_m=prominence,
                 compactness=compactness,
                 solidity=solidity,
+                peak_offset_ratio=peak_offset_ratio,
                 width_m=float(r["width_m"]),
                 height_m=float(r["height_m"]),
                 score=float(score),
@@ -2730,6 +2994,31 @@ def main() -> None:
         n_clusters = len({c.cluster_id for c in candidates if c.cluster_id != -1})
         LOG.info("Clusters found: %d (noise=%d)", n_clusters, sum(1 for c in candidates if c.cluster_id == -1))
     stage_metrics["step3_cluster_sec"] = float(time.perf_counter() - step_t0)
+
+    # Validation against known site locations
+    validation_results: Optional[Dict[str, Any]] = None
+    if args.validate_against is not None:
+        val_path = Path(args.validate_against).expanduser().resolve()
+        LOG.info("Step 3b: Validating against known sites: %s", val_path)
+        try:
+            known_sites = load_known_sites(val_path)
+            LOG.info("Loaded %d known site locations", len(known_sites))
+            validation_results = validate_candidates(
+                candidates, known_sites, match_radius_m=float(args.validate_match_radius_m)
+            )
+            val_json_path = out_dir / "validation_results.json"
+            write_validation_json(validation_results, val_json_path)
+            LOG.info(
+                "Validation: %d/%d known sites hit (recall=%.1f%%) | mean rank of hits=%.1f | written: %s",
+                int(validation_results["hits"]),
+                int(validation_results["known_sites"]),
+                float(validation_results["recall"]) * 100.0,
+                float(validation_results["mean_rank_of_hits"] or 0),
+                val_json_path,
+            )
+        except Exception as exc:
+            LOG.warning("Validation failed: %s", exc)
+            print(f"WARNING: validation failed: {exc}", file=sys.stderr)
 
     LOG.info("Step 4: Exporting GIS products")
     step_t0 = time.perf_counter()
@@ -2799,6 +3088,7 @@ def main() -> None:
             params=params,
             pos_thresh=pos_thresh,
             min_density=min_density,
+            validation_results=validation_results,
         )
         LOG.info("Wrote report.html: %s", html_out)
         stage_metrics["step7_html_sec"] = float(time.perf_counter() - step_t0)
