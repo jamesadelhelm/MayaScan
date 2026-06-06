@@ -521,6 +521,17 @@ def hillshade(dtm: np.ndarray, res_m: float, azimuth_deg: float = 315.0, altitud
 # LRM
 # -----------------------------
 def build_multiscale_lrm(dtm: np.ndarray, params: Params) -> np.ndarray:
+    # Each (small, large) sigma pair computes a Gaussian-difference bandpass that
+    # isolates surface variation at a specific spatial scale.  At 1 m/px the
+    # defaults (small: 1–2 px, large: 8–16 px) target features whose footprints
+    # span roughly 5–200 m² — consistent with Maya platform and low-mound sizes
+    # (Chase et al. 2010; Evans et al. 2013).  Small sigma preserves sharp edges;
+    # large sigma provides a regional background estimate that removes broad slopes.
+    #
+    # The maximum across all pairs is retained at each pixel so that each location
+    # is represented by whichever scale produces the strongest relief contrast.
+    # This is a novel fusion strategy without peer-reviewed validation; users
+    # should sanity-check results against known features before drawing conclusions.
     fill = np.nanmedian(dtm)
     dtm_f = np.where(np.isnan(dtm), fill, dtm).astype("float32")
 
@@ -975,6 +986,52 @@ def _utm_epsg_from_lonlat(lon: float, lat: float) -> int:
     zone = int(math.floor((lon + 180.0) / 6.0) + 1)
     zone = max(1, min(60, zone))
     return (32600 + zone) if lat >= 0 else (32700 + zone)
+
+
+def _check_utm_zone_boundary(dtm: np.ndarray, dtm_prof: Dict[str, Any], src_crs: CRS) -> None:
+    """Warn when the DTM footprint crosses a UTM zone boundary or the equator.
+
+    Both conditions mean that a single UTM zone cannot represent all corners of
+    the tile without metric distortion.  The DBSCAN clustering step and the
+    centroid coordinates in CSV/KML outputs will be slightly off near the seam.
+    """
+    H, W = dtm.shape
+    t = dtm_prof["transform"]
+    corners_src = [
+        (t.c,               t.f),
+        (t.c + W * t.a,     t.f),
+        (t.c,               t.f + H * t.e),
+        (t.c + W * t.a,     t.f + H * t.e),
+    ]
+    to_ll = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
+    lons = []
+    lats = []
+    for cx, cy in corners_src:
+        lon, lat = to_ll.transform(cx, cy)
+        lons.append(lon)
+        lats.append(lat)
+
+    zone_nums = {int(math.floor((lon + 180.0) / 6.0)) for lon in lons}
+    if len(zone_nums) > 1:
+        msg = (
+            f"DTM footprint spans a UTM zone boundary "
+            f"(lon {min(lons):.3f}° to {max(lons):.3f}°, zones {sorted(zone_nums)}). "
+            "DBSCAN clustering distances and metric coordinate exports may be "
+            "inaccurate near the boundary. Consider splitting the tile or using "
+            "a custom equal-area CRS."
+        )
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
+
+    if min(lats) < 0.0 < max(lats):
+        msg = (
+            "DTM footprint crosses the equator "
+            f"(lat {min(lats):.3f}° to {max(lats):.3f}°). "
+            "UTM hemisphere codes differ across the equator; verify that output "
+            "coordinates near lat=0 are correct."
+        )
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
 
 
 def _projected_unit_factor_to_meters(src_crs: CRS) -> Optional[float]:
@@ -1891,8 +1948,32 @@ KML labels: top <b>{params.kml_label_top_n}</b>
 
 <div class='hr'></div>
 <h2>Top candidates</h2>
-<div class='small'>Click coordinates to open in Google Maps. Images show LRM + hillshade panels when available.</div>
+<div class='small'>
+  Coordinates: <b>WGS84 (EPSG:4326)</b>.
+  Reported positions are region centroids; horizontal accuracy is typically
+  <b>±2–5&times; the input resolution</b> and degrades for large or irregular regions.
+  Do not use for sub-meter field navigation.
+  Click a coordinate link to open in Google Maps.
+  Images show LRM + hillshade panels when available.
+</div>
 <div class='hr'></div>
+"""
+
+    if not top:
+        doc += """
+<div style='background:#fef9c3;border:1px solid #fde047;border-radius:12px;padding:16px 20px;margin:12px 0;'>
+  <b>No candidates passed all filters.</b>
+  This is usually a parameter issue, not an empty landscape. Try one or more of:
+  <ul style='margin:8px 0 0 0;line-height:1.8;'>
+    <li>Lower <code>--pos-thresh</code> (e.g. <code>auto:p94</code> or <code>auto:p93</code>)</li>
+    <li>Lower <code>--min-density</code> (e.g. <code>auto:p50</code>)</li>
+    <li>Lower <code>--min-peak</code> (e.g. <code>0.30</code>)</li>
+    <li>Reduce <code>--consensus-min-support</code> to <code>1</code> or pass <code>--no-consensus</code></li>
+    <li>Reduce <code>--min-area-m2</code> or <code>--min-extent</code></li>
+    <li>Verify the point cloud is ground-classified (consider <code>--try-smrf</code>)</li>
+    <li>Check <code>run_params.json</code> for per-stage drop counts to find the tightest filter</li>
+  </ul>
+</div>
 """
 
     for rank, c in enumerate(top, start=1):
@@ -1965,7 +2046,7 @@ const points = {s_points};
 const map = L.map('map').setView([{center_lat:.8f}, {center_lon:.8f}], 14);
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
   maxZoom: 19,
-  attribution: '&copy; OpenStreetMap contributors'
+  attribution: '&copy; OpenStreetMap contributors | Coordinates: WGS84 (EPSG:4326)'
 }}).addTo(map);
 
 function radiusFromScore(score) {{
@@ -2262,6 +2343,7 @@ def main() -> None:
         raise RuntimeError("DTM has no CRS; cannot export lon/lat")
     src_crs = CRS.from_user_input(crs_any)
     transformer_ll = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
+    _check_utm_zone_boundary(dtm, dtm_prof, src_crs)
 
     # Candidate build + filters
     candidates: List[Candidate] = []

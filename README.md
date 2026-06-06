@@ -166,7 +166,7 @@ python maya_scan.py \
 ## How It Works
 
 1. **Ground model**: PDAL converts the point cloud into a DTM raster. Optional SMRF classification can be applied first.
-2. **Local relief model**: MayaScan computes a multi-scale LRM by subtracting a broader smoothed surface from a finer one.
+2. **Local relief model**: MayaScan computes a multi-scale LRM by subtracting a broad Gaussian-smoothed surface from a finer one across multiple scale pairs. At 1 m/px, the default sigma pairs (small: 1–2 px; large: 8–16 px) isolate features whose footprints span roughly 5–200 m², matching typical Maya platform and low-mound sizes. The maximum across all scale combinations is retained at each pixel to preserve the strongest relief signal regardless of which scale best represents a given feature. This fusion strategy is novel; users should calibrate results against features of known location and size before drawing interpretive conclusions.
 3. **Region detection**: connected positive-relief regions are extracted and cleaned up morphologically.
 4. **Consensus support**: optional multi-threshold runs match regions across percentile thresholds using raster overlap, with centroid distance as a secondary guard, and keep candidates with enough support.
 5. **Region metrics**: each candidate region gets area, peak relief, prominence, extent, aspect ratio, compactness, solidity, and size metrics.
@@ -236,6 +236,10 @@ The Streamlit app can also prepare a ZIP archive of run outputs. Across runs, Ma
 
 Candidate exports include clustering fields such as `cluster_id` and `dist_to_core_km`, where `dist_to_core_km` is the distance to the densest candidate within the same cluster.
 
+### Coordinate accuracy
+
+All output coordinates are WGS84 (EPSG:4326). Reported positions are region centroids; horizontal accuracy is typically ±2–5× the input resolution and degrades for large or irregular regions. Do not use reported coordinates as a substitute for precise field survey or GPS waypoints.
+
 ## Scoring and Run Quality
 
 By default, candidates are ranked with this multiplicative score:
@@ -252,7 +256,7 @@ Score =
   x Area^0.50
 ```
 
-The score is only meaningful within a run. It is a ranking signal, not a calibrated probability.
+The score is only meaningful within a run. It is a ranking signal, not a calibrated probability. The exponents were chosen heuristically to balance multiple quality signals; they have not been formally calibrated against archaeological ground truth. Users who run MayaScan on sites with known features are encouraged to verify that the top-ranked candidates correspond to confirmed architecture before treating the ranking as authoritative.
 
 The Streamlit app also reports a simple run-quality heuristic based on five checks:
 
@@ -281,10 +285,15 @@ MayaScan currently works on local input files only. No API key is required.
 - MayaScan does not confirm archaeological features; it only prioritizes anomalies.
 - Scores are relative within a run and should not be interpreted as probabilities.
 - Strict consensus settings can suppress isolated true positives.
-- False positives are more common in rugged terrain, modern earthworks, and heavily modified landscapes.
-- Output quality depends on point-cloud quality, ground classification quality, and parameter choice.
+- False positives are more common in rugged terrain, karst topography, modern earthworks, tree-throw mounds, and heavily modified landscapes.
+- Output quality depends on point-cloud density, ground classification quality, and parameter choice.
 - Analyst labels are review metadata, not training labels.
-- The current workflow is mainly tuned for single-tile or tile-at-a-time analysis.
+- The current workflow is mainly tuned for single-tile or tile-at-a-time analysis; results are not merged across tile boundaries.
+- **False positive and negative rates have not been formally quantified.** Results should be compared against known features in the survey area before use in publication.
+- **The multi-scale LRM maximum-fusion operator is novel and unvalidated in peer-reviewed literature.** Users should treat it as an exploratory tool.
+- **Scoring exponents are heuristic**, not derived from statistical calibration against ground truth.
+- If the input tile spans a UTM zone boundary or the equator, a runtime warning is emitted. Metric clustering distances and coordinate exports may be slightly inaccurate near such boundaries.
+- Coordinate accuracy for reported centroids is typically ±2–5× the input resolution. Do not use for sub-meter field navigation.
 
 ## Future Work
 
