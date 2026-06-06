@@ -391,6 +391,77 @@ def pdal_version() -> str:
         return "pdal (unknown)"
 
 
+def query_point_cloud_info(laz_path: Path) -> Dict[str, Any]:
+    """Run pdal info --summary and return parsed JSON, or {} on failure."""
+    try:
+        proc = subprocess.run(
+            ["pdal", "info", "--summary", str(laz_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            return {}
+        return json.loads(proc.stdout or "{}")
+    except Exception:
+        return {}
+
+
+def check_point_cloud_density(laz_path: Path, dtm_resolution_m: float) -> Optional[float]:
+    """
+    Return approximate point density (pts/m²) or None if unavailable.
+    Warns if density is too low for the chosen DTM resolution.
+    Assumes the source CRS is metric (typical for pre-processed LAZ tiles).
+    """
+    info = query_point_cloud_info(laz_path)
+    summary = info.get("summary", {})
+    num_points = summary.get("num_points") or summary.get("numPoints")
+    bounds = summary.get("bounds", {})
+
+    if num_points is None or not bounds:
+        LOG.info("Point cloud density check skipped (pdal info returned no summary data)")
+        return None
+
+    try:
+        dx = float(bounds.get("maxx", 0)) - float(bounds.get("minx", 0))
+        dy = float(bounds.get("maxy", 0)) - float(bounds.get("miny", 0))
+        area_m2 = dx * dy
+    except (TypeError, ValueError):
+        return None
+
+    if area_m2 <= 0:
+        return None
+
+    density = float(num_points) / area_m2
+    LOG.info(
+        "Point cloud: %d points | tile area ~%.0f m² | density ~%.2f pts/m²",
+        int(num_points), area_m2, density,
+    )
+
+    if density < 1.0:
+        msg = (
+            f"Point cloud density is very low ({density:.2f} pts/m²). "
+            f"A reliable {dtm_resolution_m:.1f} m DTM typically needs ≥4 pts/m². "
+            "Results are likely unreliable — consider a coarser resolution or "
+            "a better-covered tile."
+        )
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
+    elif density < 4.0:
+        msg = (
+            f"Point cloud density is marginal ({density:.2f} pts/m²) for a "
+            f"{dtm_resolution_m:.1f} m DTM. Consider --resolution-m 2 or "
+            "verify point coverage before interpreting results."
+        )
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
+    else:
+        LOG.info("Point cloud density adequate for %.1f m resolution (%.2f pts/m²)", dtm_resolution_m, density)
+
+    return density
+
+
 def build_dtm_from_laz(
     laz_path: Path,
     out_dtm_tif: Path,
@@ -628,6 +699,11 @@ class Candidate:
     cluster_id: int = -1
     dist_to_core_km: Optional[float] = None  # distance to densest candidate within the same cluster
     img_relpath: Optional[str] = None
+    # Bounding-box in raster pixel coords (used for polygon export)
+    bbox_px_x0: int = 0
+    bbox_px_y0: int = 0
+    bbox_px_x1: int = 0
+    bbox_px_y1: int = 0
 
 
 def _region_perimeter_pixels(region_mask: np.ndarray) -> float:
@@ -1273,6 +1349,68 @@ def write_geojson(candidates: List[Candidate], out_path: Path) -> None:
     out_path.write_text(json.dumps({"type": "FeatureCollection", "features": feats}, indent=2), encoding="utf-8")
 
 
+def write_regions_geojson(
+    candidates: List[Candidate],
+    dtm_transform: Any,
+    transformer_ll: Transformer,
+    out_path: Path,
+) -> None:
+    """
+    Export candidate detected regions as bounding-box Polygon features.
+    Polygons are the pixel-space bounding boxes of connected components,
+    converted to WGS84 corner coordinates. Useful for visual QA in QGIS/ArcGIS
+    and for comparing detected shape to the LRM raster.
+    """
+    feats = []
+    for c in candidates:
+        # Corner pixels of the bounding box; each corner is the pixel *center*.
+        # We offset by ±0.5 pixel to represent the outer edge of the bounding cells.
+        # pix2map_xy expects (row, col) = (y, x).
+        x0, y0, x1, y1 = c.bbox_px_x0, c.bbox_px_y0, c.bbox_px_x1, c.bbox_px_y1
+        # Four outer corners (top-left, top-right, bottom-right, bottom-left)
+        # using pixel-edge offsets so the polygon encloses the full pixel footprint.
+        corners_rc = [
+            (y0 - 0.5, x0 - 0.5),
+            (y0 - 0.5, x1 + 0.5),
+            (y1 + 0.5, x1 + 0.5),
+            (y1 + 0.5, x0 - 0.5),
+        ]
+        ring = []
+        for (row, col) in corners_rc:
+            x_map, y_map = pix2map_xy(dtm_transform, row, col)
+            lon, lat = transformer_ll.transform(x_map, y_map)
+            ring.append([round(float(lon), 8), round(float(lat), 8)])
+        ring.append(ring[0])  # close the ring
+
+        feats.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [ring]},
+                "properties": {
+                    "cand_id": c.cand_id,
+                    "score": c.score,
+                    "density": c.density,
+                    "peak_relief_m": c.peak_relief_m,
+                    "area_m2": c.area_m2,
+                    "width_m": c.width_m,
+                    "height_m": c.height_m,
+                    "extent": c.extent,
+                    "aspect": c.aspect,
+                    "compactness": c.compactness,
+                    "solidity": c.solidity,
+                    "prominence_m": c.prominence_m,
+                    "consensus_support": c.consensus_support,
+                    "cluster_id": c.cluster_id,
+                    "dist_to_core_km": c.dist_to_core_km,
+                    "centroid_lon": c.lon,
+                    "centroid_lat": c.lat,
+                },
+            }
+        )
+
+    out_path.write_text(json.dumps({"type": "FeatureCollection", "features": feats}, indent=2), encoding="utf-8")
+
+
 def write_csv(candidates: List[Candidate], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", newline="", encoding="utf-8") as f:
@@ -1716,6 +1854,7 @@ def write_run_params_json(
     candidate_count: int,
     stage_metrics: Optional[Dict[str, float]] = None,
     dtm_coverage: Optional[float] = None,
+    point_density: Optional[float] = None,
 ) -> Path:
     input_file_meta: Dict[str, Any] = {}
     try:
@@ -1736,6 +1875,7 @@ def write_run_params_json(
         "source_crs": src_crs.to_string(),
         "clustering_crs": None if clustering_crs is None else clustering_crs.to_string(),
         "dtm_coverage_fraction": None if dtm_coverage is None else round(float(dtm_coverage), 6),
+        "point_density_per_m2": None if point_density is None else round(float(point_density), 4),
         "resolved_thresholds": {
             "pos_relief_m": float(pos_thresh),
             "min_density": float(min_density),
@@ -2369,6 +2509,7 @@ def main() -> None:
     lrm_path = out_dir / "lrm.tif"
     density_path = out_dir / "mound_density.tif"
     geojson_path = out_dir / "candidates.geojson"
+    regions_geojson_path = out_dir / "candidate_regions.geojson"
     kml_path = out_dir / "candidates.kml"
     csv_path = out_dir / "candidates.csv"
     clusters_csv = out_dir / "clusters.csv"
@@ -2377,8 +2518,9 @@ def main() -> None:
 
     tmp_dir = out_dir / "_tmp"
 
-    LOG.info("Step 0: Building DTM from LAZ/LAS")
+    LOG.info("Step 0: Point cloud QC + DTM build")
     step_t0 = time.perf_counter()
+    point_density = check_point_cloud_density(input_path, params.dtm_resolution_m)
     build_dtm_from_laz(
         laz_path=input_path,
         out_dtm_tif=dtm_path,
@@ -2538,6 +2680,10 @@ def main() -> None:
                 score=float(score),
                 lon=float(lon),
                 lat=float(lat),
+                bbox_px_x0=int(r["x0"]),
+                bbox_px_y0=int(r["y0"]),
+                bbox_px_x1=int(r["x1"]),
+                bbox_px_y1=int(r["y1"]),
             )
         )
         cand_id += 1
@@ -2588,7 +2734,10 @@ def main() -> None:
     LOG.info("Step 4: Exporting GIS products")
     step_t0 = time.perf_counter()
     write_geojson(candidates, geojson_path)
-    LOG.info("Wrote GeoJSON: %s", geojson_path)
+    LOG.info("Wrote GeoJSON (centroids): %s", geojson_path)
+
+    write_regions_geojson(candidates, dtm_transform, transformer_ll, regions_geojson_path)
+    LOG.info("Wrote GeoJSON (region polygons): %s", regions_geojson_path)
 
     write_kml(candidates, kml_path, label_top_n=params.kml_label_top_n)
     LOG.info("Wrote KML: %s", kml_path)
@@ -2673,6 +2822,7 @@ def main() -> None:
         candidate_count=len(candidates),
         stage_metrics=stage_metrics,
         dtm_coverage=dtm_coverage,
+        point_density=point_density,
     )
     LOG.info("Wrote run_params.json: %s", params_json)
 

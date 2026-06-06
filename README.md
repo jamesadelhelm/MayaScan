@@ -165,15 +165,16 @@ python maya_scan.py \
 
 ## How It Works
 
-1. **Ground model**: PDAL converts the point cloud into a DTM raster. Optional SMRF classification can be applied first.
-2. **Local relief model**: MayaScan computes a multi-scale LRM by subtracting a broad Gaussian-smoothed surface from a finer one across multiple scale pairs. At 1 m/px, the default sigma pairs (small: 1–2 px; large: 8–16 px) isolate features whose footprints span roughly 5–200 m², matching typical Maya platform and low-mound sizes. The maximum across all scale combinations is retained at each pixel to preserve the strongest relief signal regardless of which scale best represents a given feature. This fusion strategy is novel; users should calibrate results against features of known location and size before drawing interpretive conclusions.
-3. **Region detection**: connected positive-relief regions are extracted and cleaned up morphologically.
-4. **Consensus support**: optional multi-threshold runs match regions across percentile thresholds using raster overlap, with centroid distance as a secondary guard, and keep candidates with enough support.
-5. **Region metrics**: each candidate region gets area, peak relief, prominence, extent, aspect ratio, compactness, solidity, and size metrics.
-6. **Density modeling**: a smoothed feature-density surface is built and sampled at the region level.
-7. **Post-filtering**: regions are filtered by density, shape, slope, edge proximity, and spacing to reduce noise and duplicates.
-8. **Scoring and clustering**: remaining candidates are ranked, clustered with DBSCAN, and annotated with distance to the densest member of their assigned cluster.
-9. **Reporting**: the pipeline writes GIS exports, plots, reports, and run metadata for reproducibility.
+1. **Point cloud QC**: before building the DTM, MayaScan runs `pdal info --summary` to estimate point density (pts/m²). A warning is emitted for densities below 4 pts/m² and an error below 1 pt/m², since sparse clouds produce unreliable DTMs at 1 m resolution.
+2. **Ground model**: PDAL converts the point cloud into a DTM raster. Optional SMRF classification can be applied first. SMRF parameters (`--smrf-scalar`, `--smrf-slope`, `--smrf-threshold`, `--smrf-window`) are now configurable to accommodate non-standard terrain.
+3. **Local relief model**: MayaScan computes a multi-scale LRM by subtracting a broad Gaussian-smoothed surface from a finer one across multiple scale pairs. At 1 m/px, the default sigma pairs (small: 1–2 px; large: 8–16 px) isolate features whose footprints span roughly 5–200 m², matching typical Maya platform and low-mound sizes. The maximum across all scale combinations is retained at each pixel to preserve the strongest relief signal regardless of which scale best represents a given feature. This fusion strategy is novel; users should calibrate results against features of known location and size before drawing interpretive conclusions.
+4. **Region detection**: connected positive-relief regions are extracted and cleaned up morphologically.
+5. **Consensus support**: optional multi-threshold runs match regions across percentile thresholds using raster overlap, with centroid distance as a secondary guard, and keep candidates with enough support.
+6. **Region metrics**: each candidate region gets area, peak relief, prominence, extent, aspect ratio, compactness, solidity, and size metrics.
+7. **Density modeling**: a smoothed feature-density surface is built and sampled at the region level.
+8. **Post-filtering**: regions are filtered by density, shape, slope, edge proximity, and spacing to reduce noise and duplicates.
+9. **Scoring and clustering**: remaining candidates are ranked, clustered with DBSCAN, and annotated with distance to the densest member of their assigned cluster.
+10. **Reporting**: the pipeline writes GIS exports, plots, reports, and run metadata for reproducibility.
 
 ## Key Parameters
 
@@ -225,11 +226,13 @@ Each run writes a folder under `runs/<run_name>/`. Common outputs include:
 
 - `dtm.tif`, `lrm.tif`, `mound_density.tif`
 - `candidates.csv`
-- `candidates.geojson`, `candidates.kml`
+- `candidates.geojson` — candidate centroids as GeoJSON Points (WGS84)
+- `candidate_regions.geojson` — candidate bounding-box footprints as GeoJSON Polygons (WGS84); load directly into QGIS or ArcGIS to compare detected shapes against the LRM raster
+- `candidates.kml`
 - `report.md`, `report.pdf`, `report.html`
 - `html/img/` candidate cutouts for the HTML report
 - `plots/` diagnostic plots and histograms
-- `run_params.json` with resolved settings, thresholds, accounting, and runtimes
+- `run_params.json` with resolved settings, thresholds, accounting, runtimes, point density, and DTM coverage fraction
 - `candidate_labels.csv` when analyst labeling is used
 
 The Streamlit app can also prepare a ZIP archive of run outputs. Across runs, MayaScan appends summary information to `runs/manifest.csv`.
