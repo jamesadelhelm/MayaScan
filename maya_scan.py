@@ -163,6 +163,15 @@ def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> None:
 class Params:
     dtm_resolution_m: float = 1.0
 
+    # SMRF ground-classification parameters (used only when --try-smrf is set).
+    # Defaults match PDAL recommendations for low-relief tropical terrain.
+    # Increase smrf_scalar / smrf_slope for rougher terrain; decrease smrf_window
+    # for denser vegetation or finer detail.
+    smrf_scalar: float = 1.25
+    smrf_slope: float = 0.15
+    smrf_threshold: float = 0.5
+    smrf_window: float = 16.0
+
     # Multi-scale LRM sigmas (pixels)
     lrm_sigmas_small: Tuple[float, ...] = (1.0, 2.0)
     lrm_sigmas_large: Tuple[float, ...] = (8.0, 12.0, 16.0)
@@ -388,6 +397,10 @@ def build_dtm_from_laz(
     tmp_dir: Path,
     resolution_m: float,
     try_smrf: bool,
+    smrf_scalar: float = 1.25,
+    smrf_slope: float = 0.15,
+    smrf_threshold: float = 0.5,
+    smrf_window: float = 16.0,
 ) -> None:
     """
     Robust PDAL approach:
@@ -405,16 +418,20 @@ def build_dtm_from_laz(
 
     if try_smrf:
         smrf_out = tmp_dir / "ground_smrf.las"
+        LOG.info(
+            "SMRF params: scalar=%.3f slope=%.3f threshold=%.3f window=%.1f",
+            smrf_scalar, smrf_slope, smrf_threshold, smrf_window,
+        )
         smrf_json = {
             "pipeline": [
                 {"type": "readers.las", "filename": str(in_path)},
                 {
                     "type": "filters.smrf",
                     "ignore": "Classification[7:7]",
-                    "scalar": 1.25,
-                    "slope": 0.15,
-                    "threshold": 0.5,
-                    "window": 16.0,
+                    "scalar": float(smrf_scalar),
+                    "slope": float(smrf_slope),
+                    "threshold": float(smrf_threshold),
+                    "window": float(smrf_window),
                 },
                 {"type": "writers.las", "filename": str(smrf_out)},
             ]
@@ -480,12 +497,12 @@ def _res_m_from_profile(profile: Dict[str, Any]) -> float:
     return float((resx + resy) / 2.0)
 
 
-def write_float_geotiff(path: Path, arr: np.ndarray, base_profile: Dict[str, Any]) -> None:
+def write_float_geotiff(path: Path, arr: np.ndarray, base_profile: Dict[str, Any], nodata: Optional[float] = None) -> None:
     prof = dict(base_profile)
     prof.update(
         dtype="float32",
         count=1,
-        nodata=None,
+        nodata=nodata,
         compress="deflate",
         tiled=True,
         blockxsize=256,
@@ -503,6 +520,14 @@ def compute_slope_degrees(dtm: np.ndarray, res_m: float) -> np.ndarray:
     dz_dy, dz_dx = np.gradient(dtm_f, res_m, res_m)
     slope_rad = np.arctan(np.sqrt(dz_dx**2 + dz_dy**2))
     return np.degrees(slope_rad).astype("float32")
+
+
+def check_dtm_coverage(dtm: np.ndarray) -> Tuple[int, int, float]:
+    """Return (valid_pixels, total_pixels, coverage_fraction) for the DTM."""
+    total = int(dtm.size)
+    valid = int(np.sum(np.isfinite(dtm)))
+    frac = float(valid) / max(1, total)
+    return valid, total, frac
 
 
 def hillshade(dtm: np.ndarray, res_m: float, azimuth_deg: float = 315.0, altitude_deg: float = 45.0) -> np.ndarray:
@@ -532,21 +557,29 @@ def build_multiscale_lrm(dtm: np.ndarray, params: Params) -> np.ndarray:
     # is represented by whichever scale produces the strongest relief contrast.
     # This is a novel fusion strategy without peer-reviewed validation; users
     # should sanity-check results against known features before drawing conclusions.
+    nodata_mask = ~np.isfinite(dtm)
     fill = np.nanmedian(dtm)
-    dtm_f = np.where(np.isnan(dtm), fill, dtm).astype("float32")
+    dtm_f = np.where(nodata_mask, fill, dtm).astype("float32")
 
     lrms: List[np.ndarray] = []
     for s_small in params.lrm_sigmas_small:
-        small = gaussian_filter(dtm_f, sigma=s_small)
+        # mode='nearest' extends edge values outward instead of reflecting the
+        # raster back inward, which prevents mirror-image artifacts in the LRM
+        # near tile boundaries — a common false-positive source in low-relief terrain.
+        small = gaussian_filter(dtm_f, sigma=s_small, mode="nearest")
         for s_large in params.lrm_sigmas_large:
             if s_large <= s_small:
                 continue
-            large = gaussian_filter(dtm_f, sigma=s_large)
+            large = gaussian_filter(dtm_f, sigma=s_large, mode="nearest")
             lrms.append(small - large)
 
     if not lrms:
         raise RuntimeError("No valid sigma pairs for LRM")
-    return np.maximum.reduce(lrms).astype("float32")
+    result = np.maximum.reduce(lrms).astype("float32")
+    # Restore NoData mask so the LRM GeoTiff carries proper NaN coverage
+    # and GIS tools handle data-gap areas correctly.
+    result[nodata_mask] = np.nan
+    return result
 
 
 def parse_auto_percentile(spec: str, values: np.ndarray, positive_only: bool = True) -> float:
@@ -1362,7 +1395,7 @@ def write_kml(candidates: List[Candidate], out_path: Path, label_top_n: int) -> 
             "<Placemark>",
             f"<name>{_kml_escape(name)}</name>",
             f"<styleUrl>#{style}</styleUrl>",
-            f"<description>{desc}</description>",
+            f"<description><![CDATA[{desc}]]></description>",
             f"<Point><coordinates>{c.lon:.8f},{c.lat:.8f},0</coordinates></Point>",
             "</Placemark>",
         ]
@@ -1682,14 +1715,27 @@ def write_run_params_json(
     dropped_spacing: int,
     candidate_count: int,
     stage_metrics: Optional[Dict[str, float]] = None,
+    dtm_coverage: Optional[float] = None,
 ) -> Path:
+    input_file_meta: Dict[str, Any] = {}
+    try:
+        st = input_path.stat()
+        input_file_meta = {
+            "size_bytes": int(st.st_size),
+            "mtime_utc": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    except OSError:
+        pass
+
     payload: Dict[str, Any] = {
         "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "run_name": run_name,
         "input_path": str(input_path),
+        "input_file": input_file_meta,
         "pdal_version": pdal_ver,
         "source_crs": src_crs.to_string(),
         "clustering_crs": None if clustering_crs is None else clustering_crs.to_string(),
+        "dtm_coverage_fraction": None if dtm_coverage is None else round(float(dtm_coverage), 6),
         "resolved_thresholds": {
             "pos_relief_m": float(pos_thresh),
             "min_density": float(min_density),
@@ -1946,6 +1992,25 @@ KML labels: top <b>{params.kml_label_top_n}</b>
   </details>
 </div>
 
+<details class='card' style='margin-top:14px'>
+  <summary>Score formula</summary>
+  <p class='small' style='margin:10px 0 4px 0'>
+    <code>Score = density<sup>{params.score_density_exp:g}</sup>
+    &times; peak_relief<sup>{params.score_peak_exp:g}</sup>
+    &times; extent<sup>{params.score_extent_exp:g}</sup>
+    &times; consensus_support<sup>{params.score_consensus_exp:g}</sup>
+    &times; prominence<sup>{params.score_prominence_exp:g}</sup>
+    &times; compactness<sup>{params.score_compactness_exp:g}</sup>
+    &times; solidity<sup>{params.score_solidity_exp:g}</sup>
+    &times; area_m2<sup>{params.score_area_exp:g}</sup></code>
+  </p>
+  <p class='small'>
+    Scores are <b>relative within this run only</b> — not calibrated probabilities.
+    Exponents are heuristic and have not been formally validated against archaeological ground truth.
+    Use scores for triage ordering, not as a measure of archaeological significance.
+  </p>
+</details>
+
 <div class='hr'></div>
 <h2>Top candidates</h2>
 <div class='small'>
@@ -2117,7 +2182,12 @@ def main() -> None:
     ap.add_argument("--runs-dir", default="runs", help="Runs base directory")
     ap.add_argument("--overwrite", action="store_true", help="Allow deleting an existing run folder")
 
+    ap.add_argument("--resolution-m", type=_arg_positive_float, default=None, help="DTM raster resolution in meters (default 1.0)")
     ap.add_argument("--try-smrf", action="store_true", help="Try PDAL SMRF ground classification before DTM")
+    ap.add_argument("--smrf-scalar", type=_arg_positive_float, default=None, help="SMRF scalar parameter — sensitivity to outliers (default 1.25)")
+    ap.add_argument("--smrf-slope", type=_arg_positive_float, default=None, help="SMRF slope tolerance in m/m (default 0.15)")
+    ap.add_argument("--smrf-threshold", type=_arg_positive_float, default=None, help="SMRF initial height threshold in meters (default 0.5)")
+    ap.add_argument("--smrf-window", type=_arg_positive_float, default=None, help="SMRF max window size in meters for ground search (default 16.0)")
 
     # knobs
     ap.add_argument("--pos-thresh", type=_arg_pos_thresh_spec, default=None, help="Override pos relief threshold (e.g. 0.20 or auto:p96)")
@@ -2187,6 +2257,17 @@ def main() -> None:
         print(f"Run name sanitized: '{args.name}' -> '{run_name}'", file=sys.stderr)
 
     params = Params()
+
+    if args.resolution_m is not None:
+        params.dtm_resolution_m = args.resolution_m
+    if args.smrf_scalar is not None:
+        params.smrf_scalar = args.smrf_scalar
+    if args.smrf_slope is not None:
+        params.smrf_slope = args.smrf_slope
+    if args.smrf_threshold is not None:
+        params.smrf_threshold = args.smrf_threshold
+    if args.smrf_window is not None:
+        params.smrf_window = args.smrf_window
 
     if args.pos_thresh is not None:
         params.pos_relief_threshold_spec = args.pos_thresh
@@ -2304,6 +2385,10 @@ def main() -> None:
         tmp_dir=tmp_dir,
         resolution_m=params.dtm_resolution_m,
         try_smrf=bool(args.try_smrf),
+        smrf_scalar=params.smrf_scalar,
+        smrf_slope=params.smrf_slope,
+        smrf_threshold=params.smrf_threshold,
+        smrf_window=params.smrf_window,
     )
     stage_metrics["step0_dtm_sec"] = float(time.perf_counter() - step_t0)
     LOG.info("DTM written: %s", dtm_path)
@@ -2314,9 +2399,28 @@ def main() -> None:
     dtm_transform = dtm_prof["transform"]
     res_m = _res_m_from_profile(dtm_prof)
 
+    valid_pix, total_pix, dtm_coverage = check_dtm_coverage(dtm)
+    LOG.info(
+        "DTM coverage: %d / %d valid pixels (%.1f%%)",
+        valid_pix, total_pix, dtm_coverage * 100.0,
+    )
+    if dtm_coverage < 0.05:
+        raise RuntimeError(
+            f"DTM has only {dtm_coverage * 100:.1f}% valid pixels — ground classification likely "
+            "failed or the tile has too few ground returns. "
+            "Try --try-smrf, inspect the point cloud, or check that the input has Class 2 returns."
+        )
+    if dtm_coverage < 0.70:
+        msg = (
+            f"DTM coverage is low ({dtm_coverage * 100:.1f}% valid pixels). "
+            "Results may be unreliable in data-sparse areas."
+        )
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
+
     slope_deg = compute_slope_degrees(dtm, res_m=float(res_m))
     lrm = build_multiscale_lrm(dtm, params)
-    write_float_geotiff(lrm_path, lrm, dtm_prof)
+    write_float_geotiff(lrm_path, lrm, dtm_prof, nodata=float("nan"))
     stage_metrics["step1_lrm_sec"] = float(time.perf_counter() - step_t0)
     LOG.info("LRM written: %s", lrm_path)
 
@@ -2568,6 +2672,7 @@ def main() -> None:
         dropped_spacing=dropped_spacing,
         candidate_count=len(candidates),
         stage_metrics=stage_metrics,
+        dtm_coverage=dtm_coverage,
     )
     LOG.info("Wrote run_params.json: %s", params_json)
 
