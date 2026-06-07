@@ -206,6 +206,10 @@ class Params:
     min_solidity: float = 0.50             # A / convex_hull_A in [0,1], lower = fragmented/linear
     max_peak_offset_ratio: float = 0.60   # dist(centroid→peak)/sqrt(area_pix); >0.6 ≈ ridge/slope face
 
+    # Topographic Position Index — suppresses ridge-crest false positives
+    tpi_radius_m: float = 50.0            # neighbourhood radius; larger = coarser regional context
+    max_tpi_m: float = 0.0               # 0 = disabled; ridge crests score >2 m, flat terrain <0.5 m
+
     # Depression detection (aguadas, plazas, quarries — negative-relief features)
     detect_depressions: bool = False
     neg_relief_threshold_spec: str = "auto:p96"   # applied to -LRM
@@ -597,6 +601,25 @@ def compute_slope_degrees(dtm: np.ndarray, res_m: float) -> np.ndarray:
     dz_dy, dz_dx = np.gradient(dtm_f, res_m, res_m)
     slope_rad = np.arctan(np.sqrt(dz_dx**2 + dz_dy**2))
     return np.degrees(slope_rad).astype("float32")
+
+
+def compute_tpi(dtm: np.ndarray, radius_m: float, res_m: float) -> np.ndarray:
+    """Topographic Position Index = DTM − mean(DTM within radius_m neighbourhood).
+
+    Positive TPI identifies ridge crests and hilltops; near-zero identifies flat
+    terrain and midslopes; negative identifies valley bottoms.
+
+    Uses a Gaussian-weighted neighbourhood (sigma = radius_m / 2) rather than a
+    hard disk so the filter stays separable and fast on large rasters.
+    """
+    sigma_pix = max(1.0, (radius_m / res_m) / 2.0)
+    valid = np.isfinite(dtm)
+    filled = np.where(valid, dtm, 0.0).astype("float32")
+    weight = valid.astype("float32")
+    smoothed = gaussian_filter(filled, sigma=sigma_pix, mode="nearest")
+    weight_sm = gaussian_filter(weight, sigma=sigma_pix, mode="nearest")
+    mean_surround = np.where(weight_sm > 0.1, smoothed / weight_sm, np.nan)
+    return np.where(valid, (dtm - mean_surround), np.nan).astype("float32")
 
 
 def check_dtm_coverage(dtm: np.ndarray) -> Tuple[int, int, float]:
@@ -2633,6 +2656,8 @@ def main() -> None:
     ap.add_argument("--min-compactness", type=_arg_unit_interval, default=None, help="Min compactness 4*pi*A/P^2 (0..1), lower removes line-like shapes")
     ap.add_argument("--min-solidity", type=_arg_unit_interval, default=None, help="Min solidity area/convex_hull_area (0..1), lower removes fragmented/linear shapes")
     ap.add_argument("--max-peak-offset", type=_arg_nonnegative_float, default=None, help="Max peak_offset_ratio (default 0.60); ridge/slope faces score >0.65, dome-shaped mounds <0.45")
+    ap.add_argument("--tpi-radius-m", type=_arg_positive_float, default=None, help="TPI neighbourhood radius in metres (default 50); larger = coarser regional context")
+    ap.add_argument("--max-tpi", type=_arg_nonnegative_float, default=None, help="Max TPI at candidate centroid (0=disabled); ridge crests >2 m, flat terrain <0.5 m")
 
     # Depression detection
     ap.add_argument("--detect-depressions", action="store_true", help="Run a second pipeline pass on inverted LRM to find depressions (plazas, aguadas, quarries)")
@@ -2737,6 +2762,10 @@ def main() -> None:
         params.min_solidity = args.min_solidity
     if args.max_peak_offset is not None:
         params.max_peak_offset_ratio = args.max_peak_offset
+    if args.tpi_radius_m is not None:
+        params.tpi_radius_m = args.tpi_radius_m
+    if args.max_tpi is not None:
+        params.max_tpi_m = args.max_tpi
 
     if args.detect_depressions:
         params.detect_depressions = True
@@ -2801,6 +2830,7 @@ def main() -> None:
 
     dtm_path = out_dir / "dtm.tif"
     lrm_path = out_dir / "lrm.tif"
+    tpi_path = out_dir / "tpi.tif"
     density_path = out_dir / "mound_density.tif"
     geojson_path = out_dir / "candidates.geojson"
     regions_geojson_path = out_dir / "candidate_regions.geojson"
@@ -2855,6 +2885,9 @@ def main() -> None:
         print(f"WARNING: {msg}", file=sys.stderr)
 
     slope_deg = compute_slope_degrees(dtm, res_m=float(res_m))
+    tpi = compute_tpi(dtm, radius_m=float(params.tpi_radius_m), res_m=float(res_m))
+    write_float_geotiff(tpi_path, tpi, dtm_prof, nodata=float("nan"))
+    LOG.info("TPI written: %s  (radius=%.0f m)", tpi_path, params.tpi_radius_m)
     lrm = build_multiscale_lrm(dtm, params)
     write_float_geotiff(lrm_path, lrm, dtm_prof, nodata=float("nan"))
     stage_metrics["step1_lrm_sec"] = float(time.perf_counter() - step_t0)
@@ -2927,6 +2960,10 @@ def main() -> None:
         solidity = float(r.get("solidity", 0.0))
         peak_offset_ratio = float(r.get("peak_offset_ratio", 0.0))
 
+        tpi_row = max(0, min(tpi.shape[0] - 1, int(round(float(r["cy"])))))
+        tpi_col = max(0, min(tpi.shape[1] - 1, int(round(float(r["cx"])))))
+        tpi_val = float(tpi[tpi_row, tpi_col])
+
         # post-filters for "project goal"
         if (
             peak < params.min_peak_relief_m
@@ -2938,6 +2975,7 @@ def main() -> None:
             or compactness < params.min_compactness
             or solidity < params.min_solidity
             or (params.max_peak_offset_ratio > 0.0 and peak_offset_ratio > params.max_peak_offset_ratio)
+            or (params.max_tpi_m > 0.0 and np.isfinite(tpi_val) and tpi_val > params.max_tpi_m)
         ):
             dropped_post += 1
             continue

@@ -43,6 +43,8 @@ PRESET_VALUES: dict[str, dict[str, object]] = {
         "cfg_min_compactness": 0.20,
         "cfg_min_solidity": 0.50,
         "cfg_max_peak_offset": 0.60,
+        "cfg_tpi_radius_m": 50.0,
+        "cfg_max_tpi": 2.0,
         "cfg_cluster_eps": "auto",
         "cfg_min_samples": 4,
         "cfg_report_top_n": 30,
@@ -68,6 +70,8 @@ PRESET_VALUES: dict[str, dict[str, object]] = {
         "cfg_min_compactness": 0.22,
         "cfg_min_solidity": 0.58,
         "cfg_max_peak_offset": 0.50,
+        "cfg_tpi_radius_m": 50.0,
+        "cfg_max_tpi": 1.5,
         "cfg_cluster_eps": "auto",
         "cfg_min_samples": 5,
         "cfg_report_top_n": 30,
@@ -93,6 +97,8 @@ PRESET_VALUES: dict[str, dict[str, object]] = {
         "cfg_min_compactness": 0.12,
         "cfg_min_solidity": 0.40,
         "cfg_max_peak_offset": 0.70,
+        "cfg_tpi_radius_m": 50.0,
+        "cfg_max_tpi": 0.0,
         "cfg_cluster_eps": "auto",
         "cfg_min_samples": 3,
         "cfg_report_top_n": 30,
@@ -156,6 +162,8 @@ def current_ui_config_snapshot() -> dict[str, object]:
         "cfg_smrf_threshold",
         "cfg_smrf_window",
         "cfg_max_peak_offset",
+        "cfg_tpi_radius_m",
+        "cfg_max_tpi",
         "cfg_detect_depressions",
         "cfg_validate_against",
         "cfg_validate_match_radius_m",
@@ -305,6 +313,8 @@ def build_cmd(
     smrf_threshold: float | None = None,
     smrf_window: float | None = None,
     max_peak_offset: float = 0.0,
+    tpi_radius_m: float = 50.0,
+    max_tpi: float = 0.0,
     detect_depressions: bool = False,
     validate_against: str = "",
     validate_match_radius_m: float = 25.0,
@@ -364,6 +374,9 @@ def build_cmd(
     cmd += ["--min-solidity", str(min_solidity)]
 
     cmd += ["--max-peak-offset", str(max_peak_offset)]
+    cmd += ["--tpi-radius-m", str(tpi_radius_m)]
+    if max_tpi > 0.0:
+        cmd += ["--max-tpi", str(max_tpi)]
 
     if detect_depressions:
         cmd += ["--detect-depressions"]
@@ -2014,6 +2027,30 @@ with st.sidebar:
             "Set to 0 to disable. Suggested starting point: 0.65."
         ),
     )
+    max_tpi = st.number_input(
+        "Maximum TPI at candidate (0 = disabled)",
+        min_value=0.0,
+        max_value=20.0,
+        value=st.session_state.get("cfg_max_tpi", 2.0),
+        step=0.25,
+        key="cfg_max_tpi",
+        help=(
+            "Topographic Position Index (TPI) = elevation at the candidate centroid minus the "
+            "mean elevation within the TPI radius. Ridge crests and hilltops score > 2 m; "
+            "candidates on flat or gently rolling terrain score < 0.5 m. "
+            "Enable (e.g. 2.0) to suppress false positives from natural ridges. "
+            "Set to 0 to disable — recommended for hilly terrain where real sites occupy hilltops."
+        ),
+    )
+    tpi_radius_m = st.number_input(
+        "TPI radius (m)",
+        min_value=10.0,
+        max_value=500.0,
+        value=st.session_state.get("cfg_tpi_radius_m", 50.0),
+        step=10.0,
+        key="cfg_tpi_radius_m",
+        help="Neighbourhood radius used to compute TPI. Larger values capture broader topographic context.",
+    )
 
     st.divider()
     st.markdown("### 6) Clustering (settlement patterns)")
@@ -2224,6 +2261,8 @@ def resolve_input_and_run():
         smrf_threshold=float(smrf_threshold),
         smrf_window=float(smrf_window),
         max_peak_offset=float(max_peak_offset),
+        tpi_radius_m=float(tpi_radius_m),
+        max_tpi=float(max_tpi),
         detect_depressions=bool(detect_depressions),
         validate_against=str(validate_against),
         validate_match_radius_m=float(validate_match_radius_m),
@@ -2355,6 +2394,9 @@ def resolve_and_run_preset_comparison(selected_compare_presets: list[str]):
             min_prominence=float(vals["cfg_min_prominence"]),
             min_compactness=float(vals["cfg_min_compactness"]),
             min_solidity=float(vals["cfg_min_solidity"]),
+            max_peak_offset=float(vals.get("cfg_max_peak_offset", 0.60)),
+            tpi_radius_m=float(vals.get("cfg_tpi_radius_m", 50.0)),
+            max_tpi=float(vals.get("cfg_max_tpi", 0.0)),
             cluster_eps=str(vals["cfg_cluster_eps"]),
             min_samples=int(vals["cfg_min_samples"]),
             report_top_n=int(vals["cfg_report_top_n"]),
