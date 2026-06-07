@@ -147,6 +147,14 @@ def current_ui_config_snapshot() -> dict[str, object]:
         "cfg_report_top_n",
         "cfg_label_top_n",
         "cfg_annotation_mode",
+        "cfg_resolution_m",
+        "cfg_smrf_scalar",
+        "cfg_smrf_slope",
+        "cfg_smrf_threshold",
+        "cfg_smrf_window",
+        "cfg_max_peak_offset",
+        "cfg_validate_against",
+        "cfg_validate_match_radius_m",
     ]
     out: dict[str, object] = {}
     for key in keys:
@@ -287,6 +295,14 @@ def build_cmd(
     report_top_n: int,
     label_top_n: int,
     no_html: bool,
+    resolution_m: float | None = None,
+    smrf_scalar: float | None = None,
+    smrf_slope: float | None = None,
+    smrf_threshold: float | None = None,
+    smrf_window: float | None = None,
+    max_peak_offset: float = 0.0,
+    validate_against: str = "",
+    validate_match_radius_m: float = 25.0,
 ):
     cmd = [sys.executable, str(SCRIPT_PATH)]
     cmd += ["-i", str(input_path)]
@@ -299,6 +315,19 @@ def build_cmd(
         cmd += ["--try-smrf"]
     if no_html:
         cmd += ["--no-html"]
+
+    if resolution_m is not None and resolution_m > 0:
+        cmd += ["--resolution-m", str(resolution_m)]
+
+    if try_smrf:
+        if smrf_scalar is not None:
+            cmd += ["--smrf-scalar", str(smrf_scalar)]
+        if smrf_slope is not None:
+            cmd += ["--smrf-slope", str(smrf_slope)]
+        if smrf_threshold is not None:
+            cmd += ["--smrf-threshold", str(smrf_threshold)]
+        if smrf_window is not None:
+            cmd += ["--smrf-window", str(smrf_window)]
 
     if pos_thresh.strip():
         cmd += ["--pos-thresh", pos_thresh.strip()]
@@ -329,12 +358,23 @@ def build_cmd(
     cmd += ["--min-compactness", str(min_compactness)]
     cmd += ["--min-solidity", str(min_solidity)]
 
+    if max_peak_offset > 0.0:
+        cmd += ["--max-peak-offset", str(max_peak_offset)]
+
     if cluster_eps.strip():
         cmd += ["--cluster-eps", cluster_eps.strip()]
     cmd += ["--min-samples", str(min_samples)]
 
     cmd += ["--report-top-n", str(report_top_n)]
     cmd += ["--label-top-n", str(label_top_n)]
+
+    if validate_against.strip():
+        validate_path = Path(validate_against.strip()).expanduser()
+        if not validate_path.is_absolute():
+            validate_path = (REPO_ROOT / validate_path).resolve()
+        if validate_path.exists():
+            cmd += ["--validate-against", str(validate_path)]
+            cmd += ["--validate-match-radius-m", str(validate_match_radius_m)]
 
     return cmd
 
@@ -1691,6 +1731,52 @@ with st.sidebar:
         value=True,
         help="Attempts to classify ground points before building the terrain model (DTM). Can help in vegetation-heavy areas.",
     )
+    if try_smrf:
+        with st.expander("SMRF tuning (advanced)", expanded=False):
+            smrf_scalar = st.number_input(
+                "SMRF scalar",
+                min_value=0.1, max_value=10.0,
+                value=st.session_state.get("cfg_smrf_scalar", 1.25),
+                step=0.05, key="cfg_smrf_scalar",
+                help="Controls the height threshold scaling. Increase in areas with taller vegetation.",
+            )
+            smrf_slope = st.number_input(
+                "SMRF slope",
+                min_value=0.01, max_value=1.0,
+                value=st.session_state.get("cfg_smrf_slope", 0.15),
+                step=0.01, key="cfg_smrf_slope",
+                help="Slope filter for ground classification. Lower = stricter on steep terrain.",
+            )
+            smrf_threshold = st.number_input(
+                "SMRF threshold (m)",
+                min_value=0.05, max_value=5.0,
+                value=st.session_state.get("cfg_smrf_threshold", 0.5),
+                step=0.05, key="cfg_smrf_threshold",
+                help="Height above ground threshold for ground/non-ground classification.",
+            )
+            smrf_window = st.number_input(
+                "SMRF window (m)",
+                min_value=1.0, max_value=100.0,
+                value=st.session_state.get("cfg_smrf_window", 16.0),
+                step=1.0, key="cfg_smrf_window",
+                help="Moving window size. Larger values help in areas with broad vegetation.",
+            )
+    else:
+        smrf_scalar = st.session_state.get("cfg_smrf_scalar", 1.25)
+        smrf_slope = st.session_state.get("cfg_smrf_slope", 0.15)
+        smrf_threshold = st.session_state.get("cfg_smrf_threshold", 0.5)
+        smrf_window = st.session_state.get("cfg_smrf_window", 16.0)
+
+    resolution_m = st.number_input(
+        "DTM resolution (m/pixel)",
+        min_value=0.25, max_value=10.0,
+        value=st.session_state.get("cfg_resolution_m", 1.0),
+        step=0.25, key="cfg_resolution_m",
+        help=(
+            "Ground model pixel size. Default 1.0 m works well for most Caracol-density tiles. "
+            "Increase to 2–5 m only for very sparse point clouds (<2 pts/m²)."
+        ),
+    )
     no_html = st.checkbox(
         "Skip HTML report",
         value=False,
@@ -1907,6 +1993,20 @@ with st.sidebar:
             "Lower values are fragmented or highly irregular features."
         ),
     )
+    max_peak_offset = st.number_input(
+        "Maximum peak offset ratio (0 = disabled)",
+        min_value=0.0,
+        max_value=3.0,
+        value=st.session_state.get("cfg_max_peak_offset", 0.0),
+        step=0.05,
+        key="cfg_max_peak_offset",
+        help=(
+            "Peak offset ratio = distance(centroid → LRM peak pixel) / sqrt(area_pixels). "
+            "Low values (< 0.5) characterize dome-shaped mounds with a central high point. "
+            "High values suggest ridge segments, tree-throw mounds, or edge artifacts. "
+            "Set to 0 to disable. Suggested starting point: 0.65."
+        ),
+    )
 
     st.divider()
     st.markdown("### 6) Clustering (settlement patterns)")
@@ -1917,6 +2017,33 @@ with st.sidebar:
     st.markdown("### 7) Outputs")
     report_top_n = st.number_input("Featured candidates (Top N)", min_value=1, max_value=500, key="cfg_report_top_n", step=1)
     label_top_n = st.number_input("KML labeled points (Top N)", min_value=0, max_value=5000, key="cfg_label_top_n", step=5)
+
+    st.divider()
+    st.markdown("### 8) Validation (optional)")
+    st.caption(
+        "Provide a CSV (columns: name,lat,lon) or GeoJSON (Point features) with known archaeological "
+        "site locations to measure recall. The HTML report will show a validation KPI bar and per-site markers."
+    )
+    validate_against = st.text_input(
+        "Known sites file (path or leave blank)",
+        value=st.session_state.get("cfg_validate_against", ""),
+        key="cfg_validate_against",
+        placeholder="data/caracol_structures_osm.csv",
+        help=(
+            "Path to a CSV with columns name,lat,lon or a GeoJSON FeatureCollection of Point features. "
+            "Relative paths are resolved from the MayaScan project root."
+        ),
+    )
+    validate_match_radius_m = st.number_input(
+        "Match radius (m)",
+        min_value=1.0, max_value=500.0,
+        value=st.session_state.get("cfg_validate_match_radius_m", 25.0),
+        step=5.0, key="cfg_validate_match_radius_m",
+        help=(
+            "A candidate counts as a hit if its centroid is within this radius of a known site. "
+            "25 m is appropriate for structure-level matching at 1 m resolution."
+        ),
+    )
 
     st.divider()
     input_ready = (uploaded is not None) if mode == "Upload .laz/.las" else bool(str(input_local).strip())
@@ -2071,6 +2198,14 @@ def resolve_input_and_run():
         report_top_n=int(report_top_n),
         label_top_n=int(label_top_n),
         no_html=no_html,
+        resolution_m=float(resolution_m),
+        smrf_scalar=float(smrf_scalar),
+        smrf_slope=float(smrf_slope),
+        smrf_threshold=float(smrf_threshold),
+        smrf_window=float(smrf_window),
+        max_peak_offset=float(max_peak_offset),
+        validate_against=str(validate_against),
+        validate_match_radius_m=float(validate_match_radius_m),
     )
 
     st.session_state.last_run_dir = str(run_dir)
@@ -2204,6 +2339,11 @@ def resolve_and_run_preset_comparison(selected_compare_presets: list[str]):
             report_top_n=int(vals["cfg_report_top_n"]),
             label_top_n=int(vals["cfg_label_top_n"]),
             no_html=no_html,
+            resolution_m=float(resolution_m),
+            smrf_scalar=float(smrf_scalar),
+            smrf_slope=float(smrf_slope),
+            smrf_threshold=float(smrf_threshold),
+            smrf_window=float(smrf_window),
         )
         run_specs.append(
             {
