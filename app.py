@@ -40,8 +40,9 @@ PRESET_VALUES: dict[str, dict[str, object]] = {
         "cfg_edge_buffer_m": 10.0,
         "cfg_min_spacing_m": 15.0,
         "cfg_min_prominence": 0.10,
-        "cfg_min_compactness": 0.12,
+        "cfg_min_compactness": 0.20,
         "cfg_min_solidity": 0.50,
+        "cfg_max_peak_offset": 0.60,
         "cfg_cluster_eps": "auto",
         "cfg_min_samples": 4,
         "cfg_report_top_n": 30,
@@ -64,8 +65,9 @@ PRESET_VALUES: dict[str, dict[str, object]] = {
         "cfg_edge_buffer_m": 12.0,
         "cfg_min_spacing_m": 18.0,
         "cfg_min_prominence": 0.14,
-        "cfg_min_compactness": 0.16,
+        "cfg_min_compactness": 0.22,
         "cfg_min_solidity": 0.58,
+        "cfg_max_peak_offset": 0.50,
         "cfg_cluster_eps": "auto",
         "cfg_min_samples": 5,
         "cfg_report_top_n": 30,
@@ -88,8 +90,9 @@ PRESET_VALUES: dict[str, dict[str, object]] = {
         "cfg_edge_buffer_m": 8.0,
         "cfg_min_spacing_m": 10.0,
         "cfg_min_prominence": 0.05,
-        "cfg_min_compactness": 0.08,
+        "cfg_min_compactness": 0.12,
         "cfg_min_solidity": 0.40,
+        "cfg_max_peak_offset": 0.70,
         "cfg_cluster_eps": "auto",
         "cfg_min_samples": 3,
         "cfg_report_top_n": 30,
@@ -360,8 +363,7 @@ def build_cmd(
     cmd += ["--min-compactness", str(min_compactness)]
     cmd += ["--min-solidity", str(min_solidity)]
 
-    if max_peak_offset > 0.0:
-        cmd += ["--max-peak-offset", str(max_peak_offset)]
+    cmd += ["--max-peak-offset", str(max_peak_offset)]
 
     if detect_depressions:
         cmd += ["--detect-depressions"]
@@ -2002,7 +2004,7 @@ with st.sidebar:
         "Maximum peak offset ratio (0 = disabled)",
         min_value=0.0,
         max_value=3.0,
-        value=st.session_state.get("cfg_max_peak_offset", 0.0),
+        value=st.session_state.get("cfg_max_peak_offset", 0.60),
         step=0.05,
         key="cfg_max_peak_offset",
         help=(

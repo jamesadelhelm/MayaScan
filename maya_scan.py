@@ -202,9 +202,9 @@ class Params:
     min_candidate_spacing_m: float = 15.0  # score-ordered de-dup spacing between candidate centers
     prominence_ring_pixels: int = 6        # ring width (pixels) for local prominence estimate
     min_prominence_m: float = 0.10         # region mean relief - local ring mean relief
-    min_compactness: float = 0.12          # 4*pi*A/P^2 in [0,1], lower = line-like
+    min_compactness: float = 0.20          # 4*pi*A/P^2 in [0,1], lower = line-like
     min_solidity: float = 0.50             # A / convex_hull_A in [0,1], lower = fragmented/linear
-    max_peak_offset_ratio: float = 0.0    # 0 disables; ~0.65 removes edge-peaked ridges/tree-throw
+    max_peak_offset_ratio: float = 0.60   # dist(centroid→peak)/sqrt(area_pix); >0.6 ≈ ridge/slope face
 
     # Depression detection (aguadas, plazas, quarries — negative-relief features)
     detect_depressions: bool = False
@@ -2632,7 +2632,7 @@ def main() -> None:
     ap.add_argument("--min-prominence", type=_arg_nonnegative_float, default=None, help="Min local prominence (m) post-filter (default 0.10)")
     ap.add_argument("--min-compactness", type=_arg_unit_interval, default=None, help="Min compactness 4*pi*A/P^2 (0..1), lower removes line-like shapes")
     ap.add_argument("--min-solidity", type=_arg_unit_interval, default=None, help="Min solidity area/convex_hull_area (0..1), lower removes fragmented/linear shapes")
-    ap.add_argument("--max-peak-offset", type=_arg_nonnegative_float, default=None, help="Max peak_offset_ratio (0=disabled); ~0.65 removes edge-peaked ridges and tree-throw clusters")
+    ap.add_argument("--max-peak-offset", type=_arg_nonnegative_float, default=None, help="Max peak_offset_ratio (default 0.60); ridge/slope faces score >0.65, dome-shaped mounds <0.45")
 
     # Depression detection
     ap.add_argument("--detect-depressions", action="store_true", help="Run a second pipeline pass on inverted LRM to find depressions (plazas, aguadas, quarries)")
