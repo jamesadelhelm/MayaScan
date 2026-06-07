@@ -86,7 +86,7 @@ A working installation recovers at least 12 of 15 synthetic mounds. See [Synthet
 streamlit run app.py
 ```
 
-1. Use `data/lidar/sample.laz` or upload your own `.laz/.las` file
+1. Use `data/lidar/bz_lr_las47_crs.laz` (4.4 km from Caracol monumental core) or upload your own `.laz/.las` file
 2. Pick a preset — **Balanced (Recommended)** is the right starting point
 3. Enter a run name and click **Run MayaScan**
 4. Review the map, candidate table, and score breakdown in the **Results** tab
@@ -96,7 +96,7 @@ streamlit run app.py
 
 ```bash
 python maya_scan.py \
-  -i data/lidar/sample.laz \
+  -i data/lidar/bz_lr_las47_crs.laz \
   --name my_run \
   --overwrite \
   --try-smrf
@@ -106,7 +106,7 @@ With depression detection enabled:
 
 ```bash
 python maya_scan.py \
-  -i data/lidar/sample.laz \
+  -i data/lidar/bz_lr_las47_crs.laz \
   --name my_run_with_depressions \
   --overwrite \
   --try-smrf \
@@ -120,7 +120,7 @@ Outputs land in `runs/<run_name>/`. The interactive report is at `runs/<run_name
 
 ```bash
 python maya_scan.py \
-  -i data/lidar/sample.laz \
+  -i data/lidar/bz_lr_las47_crs.laz \
   --name my_run \
   --overwrite \
   --try-smrf \
@@ -351,10 +351,10 @@ MayaScan/
 └── data/
     └── lidar/
         ├── .gitkeep
-        └── sample.laz            Bundled smoke-test tile
+        └── bz_lr_las47_crs.laz   Default tile — 4.4 km from Caracol monumental core
 ```
 
-`runs/` and `data/lidar/*.las/.laz` (except `sample.laz`) are gitignored.
+`runs/` and `data/lidar/*.las/.laz` are gitignored.
 
 ---
 

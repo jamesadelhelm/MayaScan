@@ -1705,7 +1705,7 @@ with st.sidebar:
         uploaded = st.file_uploader("LAZ/LAS file", type=["laz", "las"])
         st.caption("Saved into `data/lidar/` for this run.")
     else:
-        input_local = st.text_input("Local path", value="data/lidar/sample.laz")
+        input_local = st.text_input("Local path", value="data/lidar/bz_lr_las47_crs.laz")
 
     st.divider()
     st.markdown("### 2) Run")
