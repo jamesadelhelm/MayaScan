@@ -206,6 +206,11 @@ class Params:
     min_solidity: float = 0.50             # A / convex_hull_A in [0,1], lower = fragmented/linear
     max_peak_offset_ratio: float = 0.0    # 0 disables; ~0.65 removes edge-peaked ridges/tree-throw
 
+    # Depression detection (aguadas, plazas, quarries — negative-relief features)
+    detect_depressions: bool = False
+    neg_relief_threshold_spec: str = "auto:p96"   # applied to -LRM
+    min_depression_depth_m: float = 0.20           # minimum absolute depth (equiv of min_peak for mounds)
+
     # Clustering
     cluster_eps_m: float = 150.0
     cluster_eps_mode: str = "auto"  # "auto" or "fixed"
@@ -701,6 +706,7 @@ class Candidate:
     cluster_id: int = -1
     dist_to_core_km: Optional[float] = None  # distance to densest candidate within the same cluster
     img_relpath: Optional[str] = None
+    feature_type: str = "mound"  # "mound" or "depression"
     # Bounding-box in raster pixel coords (used for polygon export)
     bbox_px_x0: int = 0
     bbox_px_y0: int = 0
@@ -1359,6 +1365,7 @@ def write_geojson(candidates: List[Candidate], out_path: Path) -> None:
                     "height_m": c.height_m,
                     "cluster_id": c.cluster_id,
                     "dist_to_core_km": c.dist_to_core_km,
+                    "feature_type": c.feature_type,
                 },
             }
         )
@@ -1419,6 +1426,7 @@ def write_regions_geojson(
                     "consensus_support": c.consensus_support,
                     "cluster_id": c.cluster_id,
                     "dist_to_core_km": c.dist_to_core_km,
+                    "feature_type": c.feature_type,
                     "centroid_lon": c.lon,
                     "centroid_lat": c.lat,
                 },
@@ -1453,6 +1461,7 @@ def write_csv(candidates: List[Candidate], out_path: Path) -> None:
                 "lat",
                 "cluster_id",
                 "dist_to_core_km",
+                "feature_type",
             ]
         )
         for c in candidates:
@@ -1477,6 +1486,7 @@ def write_csv(candidates: List[Candidate], out_path: Path) -> None:
                     f"{c.lat:.8f}",
                     c.cluster_id,
                     "" if c.dist_to_core_km is None else f"{c.dist_to_core_km:.4f}",
+                    c.feature_type,
                 ]
             )
 
@@ -2051,6 +2061,7 @@ def write_html_report(
                 "lat": c.lat,
                 "lon": c.lon,
                 "img": c.img_relpath or "",
+                "feature_type": c.feature_type,
             }
         )
 
@@ -2127,6 +2138,12 @@ details.card summary {{ cursor: pointer; font-weight: 600; }}
 </head><body><div class='wrap'>
 <h1>MayaScan Report — {html.escape(run_name)}</h1>
 <div class='small'>Timestamp: <b>{ts}</b> &nbsp;|&nbsp; Input: <code>{html.escape(str(input_path))}</code></div>
+<div style='background:#fef3c7;border:1px solid #d97706;border-radius:6px;padding:10px 14px;margin:10px 0;font-size:0.82em;color:#78350f'>
+  <strong>Triage aid — not confirmed sites.</strong>
+  Candidates are terrain anomalies ranked by geomorphic metrics. Scores are relative within this run only and have no absolute meaning.
+  Archaeological interpretation and field verification are required before any candidate can be treated as a confirmed feature.
+  False-positive rates are unknown and may be high in disturbed or karst terrain.
+</div>
 <div class='topnote small'>
 pos_relief_threshold: <b>{pos_thresh:.4f} m</b> ({html.escape(params.pos_relief_threshold_spec)}) &nbsp;|&nbsp;
 min_density: <b>{min_density:.4f}</b> ({html.escape(params.min_density_spec)}) &nbsp;|&nbsp;
@@ -2249,7 +2266,7 @@ KML labels: top <b>{params.kml_label_top_n}</b>
 <table>
 <thead>
 <tr>
-<th>rank</th><th>cand_id</th><th>score</th><th>dens</th><th>peak(m)</th><th>support</th><th>prom(m)</th><th>area(m²)</th><th>extent</th><th>aspect</th><th>compact</th><th>solidity</th><th>cluster</th><th>lat</th><th>lon</th>
+<th>rank</th><th>cand_id</th><th>type</th><th>score</th><th>dens</th><th>peak(m)</th><th>support</th><th>prom(m)</th><th>area(m²)</th><th>extent</th><th>aspect</th><th>compact</th><th>solidity</th><th>cluster</th><th>lat</th><th>lon</th>
 </tr>
 </thead>
 <tbody>
@@ -2260,6 +2277,7 @@ KML labels: top <b>{params.kml_label_top_n}</b>
             "<tr>"
             f"<td>{rank}</td>"
             f"<td>{c.cand_id}</td>"
+            f"<td>{'▼ dep' if c.feature_type == 'depression' else '▲ mnd'}</td>"
             f"<td>{c.score:.3f}</td>"
             f"<td>{c.density:.3f}</td>"
             f"<td>{c.peak_relief_m:.2f}</td>"
@@ -2302,7 +2320,9 @@ function colorFromCluster(cid) {{
 const bounds = [];
 points.forEach(p => {{
   const r = radiusFromScore(p.score);
-  const col = colorFromCluster(p.cluster);
+  const isDepression = p.feature_type === 'depression';
+  const col = isDepression ? '#0369a1' : colorFromCluster(p.cluster);
+  const typeLabel = isDepression ? '▼ Depression' : '▲ Mound candidate';
   const gmaps = `https://www.google.com/maps?q=${{p.lat}},${{p.lon}}`;
 
   let imgHtml = '';
@@ -2312,7 +2332,7 @@ points.forEach(p => {{
 
   const popup = `
     <div style="font-size:14px">
-      <b>Candidate ${{p.cand_id}}</b><br/>
+      <b>Candidate ${{p.cand_id}}</b> <span style="color:${{col}}">${{typeLabel}}</span><br/>
       score <b>${{p.score.toFixed(3)}}</b> | dens ${{p.density.toFixed(3)}}<br/>
       peak ${{p.peak.toFixed(2)}}m | support ${{p.support}} | prom ${{p.prominence.toFixed(2)}}m | area ${{Math.round(p.area)}} m²<br/>
       extent ${{p.extent.toFixed(2)}} | aspect ${{p.aspect.toFixed(2)}}<br/>
@@ -2326,9 +2346,10 @@ points.forEach(p => {{
   const marker = L.circleMarker([p.lat, p.lon], {{
     radius: r,
     color: col,
-    weight: 2,
+    weight: isDepression ? 2.5 : 2,
     fillColor: col,
-    fillOpacity: 0.55
+    fillOpacity: isDepression ? 0.35 : 0.55,
+    dashArray: isDepression ? '4,3' : null,
   }}).addTo(map);
   marker.bindPopup(popup);
   bounds.push([p.lat, p.lon]);
@@ -2613,6 +2634,11 @@ def main() -> None:
     ap.add_argument("--min-solidity", type=_arg_unit_interval, default=None, help="Min solidity area/convex_hull_area (0..1), lower removes fragmented/linear shapes")
     ap.add_argument("--max-peak-offset", type=_arg_nonnegative_float, default=None, help="Max peak_offset_ratio (0=disabled); ~0.65 removes edge-peaked ridges and tree-throw clusters")
 
+    # Depression detection
+    ap.add_argument("--detect-depressions", action="store_true", help="Run a second pipeline pass on inverted LRM to find depressions (plazas, aguadas, quarries)")
+    ap.add_argument("--neg-thresh", type=_arg_pos_thresh_spec, default=None, help="Negative-relief threshold for depression detection (e.g. auto:p96 or 0.20); default auto:p96")
+    ap.add_argument("--min-depression-depth", type=_arg_positive_float, default=None, help="Minimum depression depth in meters (default 0.20)")
+
     # scoring knobs
     ap.add_argument("--score-extent-exp", type=_arg_nonnegative_float, default=None, help="Exponent for extent in score (default 0.35)")
     ap.add_argument("--score-consensus-exp", type=_arg_nonnegative_float, default=None, help="Exponent for consensus support in score (default 0.40)")
@@ -2711,6 +2737,13 @@ def main() -> None:
         params.min_solidity = args.min_solidity
     if args.max_peak_offset is not None:
         params.max_peak_offset_ratio = args.max_peak_offset
+
+    if args.detect_depressions:
+        params.detect_depressions = True
+    if args.neg_thresh is not None:
+        params.neg_relief_threshold_spec = args.neg_thresh
+    if args.min_depression_depth is not None:
+        params.min_depression_depth_m = args.min_depression_depth
 
     if args.score_extent_exp is not None:
         params.score_extent_exp = args.score_extent_exp
@@ -2969,13 +3002,111 @@ def main() -> None:
     LOG.info("Dropped by spacing de-dup (%.1f m): %d", params.min_candidate_spacing_m, dropped_spacing)
     LOG.info("Kept candidates after density + post-filters: %d", len(candidates))
 
+    if params.detect_depressions:
+        LOG.info("Step 2b: Depression detection pass (inverted LRM)")
+        neg_lrm = np.where(np.isfinite(lrm), -lrm, np.nan)
+        dep_params = replace(
+            params,
+            pos_relief_threshold_spec=params.neg_relief_threshold_spec,
+            min_peak_relief_m=params.min_depression_depth_m,
+            min_density_spec="0",
+            consensus_enabled=False,
+        )
+        dep_regions, _, _, _, _ = detect_candidates(
+            lrm=neg_lrm,
+            dtm_slope_deg=slope_deg,
+            profile=dtm_prof,
+            params=dep_params,
+            out_density_tif=out_dir / "depression_density.tif",
+        )
+        dep_dropped = 0
+        dep_added_before = len(candidates)
+        for r in dep_regions:
+            if edge_buffer_pix > 0:
+                x0 = int(r.get("x0", 0))
+                y0 = int(r.get("y0", 0))
+                x1 = int(r.get("x1", W - 1))
+                y1 = int(r.get("y1", H - 1))
+                if x0 < edge_buffer_pix or y0 < edge_buffer_pix or x1 > (W - 1 - edge_buffer_pix) or y1 > (H - 1 - edge_buffer_pix):
+                    dep_dropped += 1
+                    continue
+
+            peak = float(r["peak"])
+            area_m2 = float(r["area_m2"])
+            extent = float(r["extent"])
+            aspect = float(r["aspect"])
+            prominence = float(r.get("prominence_m", 0.0))
+            compactness = float(r.get("compactness", 0.0))
+            solidity = float(r.get("solidity", 0.0))
+            peak_offset_ratio = float(r.get("peak_offset_ratio", 0.0))
+
+            if (
+                peak < dep_params.min_peak_relief_m
+                or area_m2 < dep_params.min_area_m2
+                or (dep_params.max_area_m2 > 0.0 and area_m2 > dep_params.max_area_m2)
+                or extent < dep_params.min_extent
+                or aspect > dep_params.max_aspect
+                or prominence < dep_params.min_prominence_m
+                or compactness < dep_params.min_compactness
+                or solidity < dep_params.min_solidity
+            ):
+                dep_dropped += 1
+                continue
+
+            x_map, y_map = pix2map_xy(dtm_transform, r["cy"], r["cx"])
+            lon, lat = transformer_ll.transform(x_map, y_map)
+
+            dep_score = (
+                (max(_SCORE_FLOOR_PEAK, peak) ** dep_params.score_peak_exp)
+                * (max(_SCORE_FLOOR_PROMINENCE, prominence) ** dep_params.score_prominence_exp)
+                * (max(_SCORE_FLOOR_COMPACTNESS, compactness) ** dep_params.score_compactness_exp)
+                * (max(_SCORE_FLOOR_SOLIDITY, solidity) ** dep_params.score_solidity_exp)
+                * (max(_SCORE_FLOOR_AREA, area_m2) ** dep_params.score_area_exp)
+            )
+
+            candidates.append(
+                Candidate(
+                    cand_id=cand_id,
+                    px_x=float(r["cx"]),
+                    px_y=float(r["cy"]),
+                    peak_relief_m=peak,
+                    mean_relief_m=float(r["mean"]),
+                    area_m2=area_m2,
+                    density=float(r.get("density_mean", 0.0)),
+                    extent=extent,
+                    aspect=aspect,
+                    consensus_support=1,
+                    prominence_m=prominence,
+                    compactness=compactness,
+                    solidity=solidity,
+                    peak_offset_ratio=peak_offset_ratio,
+                    width_m=float(r["width_m"]),
+                    height_m=float(r["height_m"]),
+                    score=float(dep_score),
+                    lon=float(lon),
+                    lat=float(lat),
+                    cluster_id=-1,
+                    feature_type="depression",
+                    bbox_px_x0=int(r["x0"]),
+                    bbox_px_y0=int(r["y0"]),
+                    bbox_px_x1=int(r["x1"]),
+                    bbox_px_y1=int(r["y1"]),
+                )
+            )
+            cand_id += 1
+
+        dep_added = len(candidates) - dep_added_before
+        LOG.info("Depression candidates added: %d (dropped edge/shape: %d)", dep_added, dep_dropped)
+
     LOG.info("Step 3: Clustering + settlement pattern analysis (meters)")
     step_t0 = time.perf_counter()
     used_m_crs: Optional[CRS] = None
-    if candidates:
+    mound_cands = [c for c in candidates if c.feature_type == "mound"]
+    dep_cands = [c for c in candidates if c.feature_type == "depression"]
+    if mound_cands:
         xs = []
         ys = []
-        for c in candidates:
+        for c in mound_cands:
             x_map, y_map = pix2map_xy(dtm_transform, c.px_y, c.px_x)
             xs.append(float(x_map))
             ys.append(float(y_map))
@@ -2986,13 +3117,14 @@ def main() -> None:
         LOG.info("Clustering CRS: %s", used_m_crs.to_string())
 
         labels = cluster_candidates_meters(xs_m, ys_m, params)
-        for c, lab in zip(candidates, labels):
+        for c, lab in zip(mound_cands, labels):
             c.cluster_id = int(lab)
 
-        assign_cluster_core_distances(candidates, xs_m, ys_m)
+        assign_cluster_core_distances(mound_cands, xs_m, ys_m)
 
-        n_clusters = len({c.cluster_id for c in candidates if c.cluster_id != -1})
-        LOG.info("Clusters found: %d (noise=%d)", n_clusters, sum(1 for c in candidates if c.cluster_id == -1))
+        n_clusters = len({c.cluster_id for c in mound_cands if c.cluster_id != -1})
+        LOG.info("Clusters found: %d (noise=%d)", n_clusters, sum(1 for c in mound_cands if c.cluster_id == -1))
+    candidates = mound_cands + dep_cands
     stage_metrics["step3_cluster_sec"] = float(time.perf_counter() - step_t0)
 
     # Validation against known site locations

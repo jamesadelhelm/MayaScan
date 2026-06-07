@@ -24,9 +24,10 @@ MayaScan is designed for triage, not confirmation. It highlights terrain anomali
 
 - Converts LAZ/LAS input into DTM, LRM, and density rasters
 - Detects region-level candidate features instead of relying on centroid-only logic
-- Supports overlap-aware multi-threshold consensus to reduce one-threshold artifacts
-- Scores candidates with interpretable components such as density, relief, prominence, compactness, solidity, and area
-- Uses DBSCAN to group candidates into possible settlement patterns
+- Optional second-pass depression detection for aguadas, plazas, and quarries (`--detect-depressions`)
+- Optional multi-threshold consensus to require candidates to appear at multiple LRM thresholds; reduces one-threshold artifacts but can suppress isolated features
+- Scores candidates with interpretable components: density, relief, prominence, compactness, solidity, area — exponents are heuristic, not calibrated against ground truth
+- Uses DBSCAN to group mound candidates into possible settlement patterns
 - Exports CSV, GeoJSON, KML, Markdown, PDF, and HTML outputs
 - Includes a Streamlit review app with presets, diagnostics, labeling, comparison mode, and ZIP export
 
@@ -81,6 +82,21 @@ pdal --version
 python -c "import rasterio, pyproj, scipy, streamlit"
 ```
 
+To verify the full pipeline works end-to-end on synthetic data:
+
+```bash
+python tests/make_synthetic_lidar.py
+python maya_scan.py \
+  -i data/lidar/synthetic_mounds.las \
+  --name install_test \
+  --overwrite \
+  --try-smrf \
+  --validate-against data/synthetic_mounds_truth.csv \
+  --validate-match-radius-m 8
+```
+
+A working installation should recover at least 12 of 15 synthetic mounds.
+
 ## Quick Start
 
 The repository includes a smoke-test tile at `data/lidar/sample.laz`.
@@ -109,6 +125,17 @@ python maya_scan.py \
   --name caracol_sample_test \
   --overwrite \
   --try-smrf
+```
+
+To include depression detection (aguadas, plazas, negative-relief features):
+
+```bash
+python maya_scan.py \
+  -i data/lidar/sample.laz \
+  --name caracol_with_depressions \
+  --overwrite \
+  --try-smrf \
+  --detect-depressions
 ```
 
 Show all options:
@@ -270,6 +297,30 @@ The Streamlit app also reports a simple run-quality heuristic based on five chec
 5. `noise / candidates <= 0.70`
 
 Quality badges such as `Strong`, `Moderate`, and `Weak/noisy` are meant for triage only.
+
+## Synthetic Validation
+
+The repository includes a synthetic test harness at `tests/make_synthetic_lidar.py`. It generates a 500×500 m point cloud (UTM 16N) containing 15 Gaussian mounds at known positions and 2 elongated ridge traps that should not be detected.
+
+To run it:
+
+```bash
+# Generate the synthetic tile and truth table
+python tests/make_synthetic_lidar.py
+
+# Run MayaScan on the synthetic tile and validate against ground truth
+python maya_scan.py \
+  -i data/lidar/synthetic_mounds.las \
+  --name synth_validation \
+  --overwrite \
+  --try-smrf \
+  --validate-against data/synthetic_mounds_truth.csv \
+  --validate-match-radius-m 8
+```
+
+On a clean run with default Balanced parameters, MayaScan recovers 14 of 15 mounds (93% recall) with no false positives from the ridge traps. The missed mound (M6) sits adjacent to a long ridge that distorts its shape metrics enough to fail the compactness filter — this is correct physical behavior.
+
+**Scope of this validation:** The synthetic tile was purpose-built with mound amplitudes and sizes tuned to the default parameters. This confirms that the detection pipeline is internally consistent and that the shape filters suppress elongated features. It does not validate performance on real archaeological data. False-positive and false-negative rates on real sites are unknown and must be assessed against features of confirmed location before operational use.
 
 ## Data Sources
 

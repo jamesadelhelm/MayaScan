@@ -153,6 +153,7 @@ def current_ui_config_snapshot() -> dict[str, object]:
         "cfg_smrf_threshold",
         "cfg_smrf_window",
         "cfg_max_peak_offset",
+        "cfg_detect_depressions",
         "cfg_validate_against",
         "cfg_validate_match_radius_m",
     ]
@@ -301,6 +302,7 @@ def build_cmd(
     smrf_threshold: float | None = None,
     smrf_window: float | None = None,
     max_peak_offset: float = 0.0,
+    detect_depressions: bool = False,
     validate_against: str = "",
     validate_match_radius_m: float = 25.0,
 ):
@@ -360,6 +362,9 @@ def build_cmd(
 
     if max_peak_offset > 0.0:
         cmd += ["--max-peak-offset", str(max_peak_offset)]
+
+    if detect_depressions:
+        cmd += ["--detect-depressions"]
 
     if cluster_eps.strip():
         cmd += ["--cluster-eps", cluster_eps.strip()]
@@ -2019,7 +2024,20 @@ with st.sidebar:
     label_top_n = st.number_input("KML labeled points (Top N)", min_value=0, max_value=5000, key="cfg_label_top_n", step=5)
 
     st.divider()
-    st.markdown("### 8) Validation (optional)")
+    st.markdown("### 8) Depression detection (optional)")
+    st.caption(
+        "Run a second pass on the inverted LRM to detect negative-relief features: aguadas (reservoirs), "
+        "plazas, quarries, and borrow pits. Depression candidates appear with a dashed blue marker (▼) in the report."
+    )
+    detect_depressions = st.checkbox(
+        "Detect depressions",
+        value=st.session_state.get("cfg_detect_depressions", False),
+        key="cfg_detect_depressions",
+        help="Inverts the LRM and runs the detection pipeline again to find bowl-shaped negative-relief features.",
+    )
+
+    st.divider()
+    st.markdown("### 9) Validation (optional)")
     st.caption(
         "Provide a CSV (columns: name,lat,lon) or GeoJSON (Point features) with known archaeological "
         "site locations to measure recall. The HTML report will show a validation KPI bar and per-site markers."
@@ -2204,6 +2222,7 @@ def resolve_input_and_run():
         smrf_threshold=float(smrf_threshold),
         smrf_window=float(smrf_window),
         max_peak_offset=float(max_peak_offset),
+        detect_depressions=bool(detect_depressions),
         validate_against=str(validate_against),
         validate_match_radius_m=float(validate_match_radius_m),
     )
@@ -2575,8 +2594,14 @@ with tab_results:
                         "Tooltip": quality_check_help.get(check_label, "Quality heuristic check."),
                     }
                 )
-            quality_summary = f"Run quality: {quality['label']} ({quality['passed']}/{quality['total']} checks)"
+            quality_summary = f"Triage quality: {quality['label']} ({quality['passed']}/{quality['total']} parameter checks)"
             with st.expander(quality_summary, expanded=False):
+                st.warning(
+                    "These checks measure whether parameter settings produced a plausible output range. "
+                    "They do NOT indicate that real archaeological features were found. "
+                    "Field verification is required before any candidate can be treated as a confirmed site.",
+                    icon="⚠️",
+                )
                 if detail_rows:
                     detail_df = pd.DataFrame(detail_rows)
                     st.dataframe(
@@ -2584,7 +2609,7 @@ with tab_results:
                         width="stretch",
                         hide_index=True,
                     )
-                st.caption("These checks are triage heuristics for review confidence, not archaeological validation.")
+                st.caption("Scores are relative within this run only and have no absolute meaning across runs.")
             with st.expander("Scoring formula explanation", expanded=False):
                 st.code(score_formula_readable_str, language="text")
                 st.caption(
