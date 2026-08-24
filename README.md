@@ -1,89 +1,84 @@
 # MayaScan
 
-**LiDAR terrain-anomaly detection for archaeological review**
+**LiDAR triage tool for Maya archaeological survey**
 
-MayaScan is a Python geospatial pipeline for turning raw LAZ/LAS point clouds into ranked candidate features for analyst review. It builds terrain rasters, detects positive-relief regions, scores them with interpretable geomorphic metrics, clusters them spatially, and exports GIS-ready outputs. The project includes both a command-line workflow and a Streamlit app for running and reviewing results in one place.
+MayaScan turns a raw LAZ/LAS point cloud into a ranked list of terrain anomalies for analyst review. It builds a Digital Terrain Model and a multi-scale Local Relief Model, extracts candidate positive- and negative-relief regions, scores them on shape and geomorphic metrics, clusters them spatially, and writes GIS-ready outputs (GeoJSON, KML, GeoTIFF) plus an interactive HTML report.
 
-MayaScan is designed for triage, not confirmation. It highlights terrain anomalies that may deserve a closer look; archaeological interpretation and field validation still require expert review.
+**MayaScan is a triage tool, not a detection system.** It produces a prioritized list of anomalies worth looking at; it does not confirm archaeological features. Expert review and field verification are always required.
 
-<p align="center">
-  <img src="assets/caracol_caana.png" width="700" alt="Caana pyramid at Caracol, Belize">
-</p>
-<p align="center">
-  <em>Visible architecture at Caracol, Belize</em>
-</p>
+---
 
-<p align="center">
-  <img src="assets/aguada_fenix_lidar.png" width="700" alt="LiDAR terrain model of Aguada Fenix, Mexico">
-</p>
-<p align="center">
-  <em>LiDAR can reveal large-scale architecture hidden beneath vegetation</em>
-</p>
+## What it detects
 
-## Highlights
+MayaScan is tuned for low-relief tropical landscapes — subtle platforms, mounds, and depressions in the range of 0.3–2.0 m, on tiles with at least 4 pts/m² ground return density. A second-pass depression mode (`--detect-depressions`) looks for aguadas (reservoirs), plazas, and quarries in the same tile.
 
-- Converts LAZ/LAS input into DTM, LRM, and density rasters
-- Detects region-level candidate features instead of relying on centroid-only logic
-- Supports overlap-aware multi-threshold consensus to reduce one-threshold artifacts
-- Scores candidates with interpretable components such as density, relief, prominence, compactness, solidity, and area
-- Uses DBSCAN to group candidates into possible settlement patterns
-- Exports CSV, GeoJSON, KML, Markdown, PDF, and HTML outputs
-- Includes a Streamlit review app with presets, diagnostics, labeling, comparison mode, and ZIP export
+It is not designed for steep or rugged terrain, highly modified landscapes (active agriculture, modern earthworks), or sub-meter-resolution feature mapping.
 
-## Designed For
+---
 
-MayaScan is currently tuned for:
+## Responsible use
 
-- low-relief tropical landscapes
-- subtle platforms and mounds, roughly `0.3-2.0 m` of relief
-- tile-by-tile exploratory analysis and ranking
+- Outputs are terrain anomalies, not confirmed sites.
+- Scores are relative within a single run; they have no meaning across runs or as probabilities.
+- False-positive and false-negative rates on real archaeological data are unknown.
+- Handle coordinate outputs carefully. Do not publish specific location data in ways that increase looting risk.
 
-## Responsible Use
-
-- MayaScan identifies **terrain anomalies**, not confirmed archaeological sites.
-- All outputs should be treated as review aids and checked by domain experts.
-- Coordinate data and derived products should be handled carefully to reduce the risk of disturbance or looting.
-- This repository includes a single demonstration tile at `data/lidar/sample.laz` for reproducible testing.
-- The project intentionally avoids publishing curated site interpretations or sensitive location outputs.
+---
 
 ## Installation
 
 ### Requirements
 
-- Python `3.10+`
-- PDAL installed at the system level
-- Python packages from `requirements.txt`
+- Python 3.10+
+- PDAL (system-level)
+- Python packages listed in `requirements.txt`
 
-Current package minimums:
-
-- `numpy>=1.23`, `scipy>=1.9`, `pandas>=1.5`
-- `rasterio>=1.3`, `pyproj>=3.4`, `shapely>=2.0`
-- `scikit-learn>=1.2`, `matplotlib>=3.6`, `reportlab>=3.6`, `streamlit>=1.30`
-
-Install PDAL:
-
-- macOS: `brew install pdal`
-- Ubuntu: `sudo apt install pdal`
-- Windows (conda): `conda install -c conda-forge pdal`
-
-Install Python dependencies:
+**Install PDAL:**
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+# macOS
+brew install pdal
+
+# Ubuntu / Debian
+sudo apt install pdal
+
+# Windows (conda)
+conda install -c conda-forge pdal
+```
+
+**Install Python dependencies:**
+
+```bash
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Recommended sanity checks:
+**Verify:**
 
 ```bash
 pdal --version
-python -c "import rasterio, pyproj, scipy, streamlit"
+python -c "import rasterio, pyproj, scipy, streamlit; print('OK')"
 ```
 
-## Quick Start
+**Full pipeline check (synthetic data):**
 
-The repository includes a smoke-test tile at `data/lidar/sample.laz`.
+```bash
+python tests/make_synthetic_lidar.py
+python maya_scan.py \
+  -i data/lidar/synthetic_mounds.las \
+  --name install_test \
+  --overwrite \
+  --try-smrf \
+  --validate-against data/synthetic_mounds_truth.csv \
+  --validate-match-radius-m 8
+```
+
+A working installation recovers at least 12 of 15 synthetic mounds. See [Synthetic Validation](#synthetic-validation) for what this does and does not prove.
+
+---
+
+## Quick start
 
 ### Streamlit app
 
@@ -91,213 +86,259 @@ The repository includes a smoke-test tile at `data/lidar/sample.laz`.
 streamlit run app.py
 ```
 
-Then:
-
-1. Use `data/lidar/sample.laz` or upload your own `.laz/.las` file
-2. Choose a preset; `Balanced (Recommended)` is the default starting point
+1. Use `data/lidar/bz_lr_las47_crs.laz` (4.4 km from Caracol monumental core) or upload your own `.laz/.las` file
+2. Pick a preset — **Balanced (Recommended)** is the right starting point
 3. Enter a run name and click **Run MayaScan**
-4. Review the map, ranked candidates, diagnostics, and score breakdown in the **Results** tab
+4. Review the map, candidate table, and score breakdown in the **Results** tab
 5. Optionally compare presets or add analyst labels (`likely`, `unlikely`, `unknown`)
 
 ### CLI
 
-Minimal run:
-
 ```bash
 python maya_scan.py \
-  -i data/lidar/sample.laz \
-  --name caracol_sample_test \
+  -i data/lidar/bz_lr_las47_crs.laz \
+  --name my_run \
   --overwrite \
   --try-smrf
 ```
 
-Show all options:
-
-```bash
-python maya_scan.py --help
-```
-
-Outputs are written to:
-
-```text
-runs/<run_name>/
-```
-
-The HTML report is written to:
-
-```text
-runs/<run_name>/report.html
-```
-
-<details>
-<summary>Advanced CLI example</summary>
+With depression detection enabled:
 
 ```bash
 python maya_scan.py \
-  -i data/lidar/sample.laz \
-  --name caracol_sample_test \
+  -i data/lidar/bz_lr_las47_crs.laz \
+  --name my_run_with_depressions \
   --overwrite \
   --try-smrf \
-  --pos-thresh auto:p96 \
-  --min-density auto:p60 \
-  --density-sigma 40 \
-  --max-slope-deg 20 \
+  --detect-depressions
+```
+
+Outputs land in `runs/<run_name>/`. The interactive report is at `runs/<run_name>/report.html`.
+
+<details>
+<summary>Full CLI reference example</summary>
+
+```bash
+python maya_scan.py \
+  -i data/lidar/bz_lr_las47_crs.laz \
+  --name my_run \
+  --overwrite \
+  --try-smrf \
+  # --- LRM thresholds ---
+  --pos-thresh auto:p96 \       # relief percentile cutoff
+  --min-density auto:p60 \      # candidate-density gate
+  --density-sigma 40 \          # smoothing radius for density surface
+  --max-slope-deg 20 \          # reject steep terrain (q75 slope)
+  # --- Consensus (multi-threshold) ---
   --consensus-percentiles 95,96,97 \
   --consensus-min-support 2 \
   --consensus-radius-m 12 \
-  --min-peak 0.50 \
+  # --- Shape filters ---
+  --min-peak 0.50 \             # minimum relief at peak pixel (m)
   --min-area-m2 25 \
   --max-area-m2 1200 \
-  --min-extent 0.38 \
-  --max-aspect 3.5 \
+  --min-extent 0.38 \           # bbox fill ratio [0,1]
+  --max-aspect 3.5 \            # long/short axis ratio
+  --min-prominence 0.10 \       # peak minus surrounding ring mean (m)
+  --min-compactness 0.12 \      # 4πA/P² circularity [0,1]
+  --min-solidity 0.50 \         # area / convex-hull area [0,1]
+  # --- Tile edge and duplicates ---
   --edge-buffer-m 10 \
   --min-spacing-m 15 \
-  --min-prominence 0.10 \
-  --min-compactness 0.12 \
-  --min-solidity 0.50 \
+  # --- Clustering ---
   --cluster-eps auto \
   --min-samples 4 \
+  # --- Output ---
   --report-top-n 30 \
   --label-top-n 60
 ```
 
 </details>
 
-## How It Works
+---
 
-1. **Ground model**: PDAL converts the point cloud into a DTM raster. Optional SMRF classification can be applied first.
-2. **Local relief model**: MayaScan computes a multi-scale LRM by subtracting a broader smoothed surface from a finer one.
-3. **Region detection**: connected positive-relief regions are extracted and cleaned up morphologically.
-4. **Consensus support**: optional multi-threshold runs match regions across percentile thresholds using raster overlap, with centroid distance as a secondary guard, and keep candidates with enough support.
-5. **Region metrics**: each candidate region gets area, peak relief, prominence, extent, aspect ratio, compactness, solidity, and size metrics.
-6. **Density modeling**: a smoothed feature-density surface is built and sampled at the region level.
-7. **Post-filtering**: regions are filtered by density, shape, slope, edge proximity, and spacing to reduce noise and duplicates.
-8. **Scoring and clustering**: remaining candidates are ranked, clustered with DBSCAN, and annotated with distance to the densest member of their assigned cluster.
-9. **Reporting**: the pipeline writes GIS exports, plots, reports, and run metadata for reproducibility.
+## How it works
 
-## Key Parameters
+1. **Point cloud QC** — PDAL reports estimated ground-return density. MayaScan warns below 4 pts/m² and aborts below 1 pt/m²; DTM quality degrades below these thresholds.
 
-### Detection
+2. **Ground model** — PDAL builds a DTM at the requested resolution (default 1 m/px). If `--try-smrf` is set, PDAL's SMRF classifier runs first to isolate ground returns from unclassified or vegetation-heavy data. SMRF parameters (`--smrf-scalar`, `--smrf-slope`, `--smrf-threshold`, `--smrf-window`) can be tuned for non-standard terrain.
 
-- `--pos-thresh auto:p96`
-  Sets the positive-relief threshold in LRM space. Higher percentiles usually produce fewer, stronger candidates.
-- `--min-density auto:p60`
-  Sets the density threshold used for filtering and scoring.
-- `--density-sigma 40`
-  Controls how broadly the candidate-density surface is smoothed.
-- `--max-slope-deg 20`
-  Rejects steep regions using the q75 slope statistic.
+3. **Local Relief Model (LRM)** — The LRM isolates micro-topographic relief by subtracting a broadly Gaussian-smoothed surface from a narrower one. MayaScan does this across multiple scale pairs and retains the maximum at each pixel, preserving the strongest relief signal regardless of which scale best matches a given feature. Default sigma pairs (small: 1–2 px; large: 8–16 px) are tuned for features 5–200 m² at 1 m resolution, covering typical Maya platform and mound sizes. The max-fusion operator is not published in peer-reviewed literature; users should cross-check results against known features before treating output as authoritative.
 
-### Consensus
+4. **Region detection** — Pixels above the relief threshold are extracted as connected regions and cleaned up morphologically (hole-fill, small-component removal).
 
-- `--consensus-percentiles 95,96,97`
-  Runs candidate extraction at multiple thresholds.
-- `--consensus-min-support 2`
-  Requires support from at least this many thresholded runs, including the primary run.
-- `--consensus-radius-m 12`
-  Sets the centroid-distance guard used when counting cross-threshold support; matches still require real raster overlap.
-- `--no-consensus`
-  Disables consensus filtering entirely.
+5. **Consensus filtering** — If enabled, the same detection runs at multiple LRM percentile thresholds. A candidate is kept only if it appears in at least N of those runs, determined by real raster overlap. This reduces one-threshold noise but can suppress isolated true positives.
 
-### Shape cleanup
+6. **Region metrics** — Each region is measured: area, peak relief, local prominence (peak minus surrounding ring mean), bounding-box extent, aspect ratio, compactness (4πA/P²), and solidity (A / convex-hull area).
 
-- `--min-peak`, `--min-area-m2`, `--max-area-m2`
-  Remove features that are too weak, too small, or too large.
-- `--min-extent`, `--max-aspect`
-  Suppress elongated or poorly filled regions.
-- `--min-prominence`, `--min-compactness`, `--min-solidity`
-  Remove regions that look weak, linear, or fragmented.
-- `--edge-buffer-m`, `--min-spacing-m`
-  Reduce tile-edge artifacts and near-duplicate detections.
+7. **Candidate-density surface** — A smoothed density raster is built from the spatial distribution of candidate centroids across the tile and sampled per region. This gives a bonus to features in spatially coherent groups and penalizes isolated outliers.
 
-### Clustering and reporting
+8. **Shape and density filters** — Candidates are dropped by minimum/maximum thresholds on all the above metrics, plus slope, tile-edge proximity, and centroid spacing. Remaining candidates are scored and ranked.
 
-- `--cluster-eps auto`
-  Uses automatic or fixed DBSCAN radius in meters. `auto` estimates eps from the k-distance knee with a percentile fallback.
-- `--min-samples`
-  Sets the minimum candidates needed to form a cluster.
-- `--report-top-n`, `--label-top-n`
-  Control how many candidates are emphasized in reports and KML labels.
+9. **Depression detection (optional)** — With `--detect-depressions`, the LRM is inverted and the same pipeline runs again. Depression candidates (aguadas, plazas, quarries) are appended to the output with `feature_type=depression` and shown as dashed blue markers in the report. They are not included in mound clustering.
+
+10. **Clustering** — Mound candidates are clustered with DBSCAN using an automatic or fixed radius. Each candidate is annotated with its cluster ID and distance to the densest member of its cluster.
+
+11. **Reporting** — Every run writes a time-stamped folder with GIS exports, diagnostic plots, a `run_params.json` for reproducibility, and an HTML report with an interactive Leaflet map.
+
+---
 
 ## Outputs
 
-Each run writes a folder under `runs/<run_name>/`. Common outputs include:
-
-- `dtm.tif`, `lrm.tif`, `mound_density.tif`
-- `candidates.csv`
-- `candidates.geojson`, `candidates.kml`
-- `report.md`, `report.pdf`, `report.html`
-- `html/img/` candidate cutouts for the HTML report
-- `plots/` diagnostic plots and histograms
-- `run_params.json` with resolved settings, thresholds, accounting, and runtimes
-- `candidate_labels.csv` when analyst labeling is used
-
-The Streamlit app can also prepare a ZIP archive of run outputs. Across runs, MayaScan appends summary information to `runs/manifest.csv`.
-
-Candidate exports include clustering fields such as `cluster_id` and `dist_to_core_km`, where `dist_to_core_km` is the distance to the densest candidate within the same cluster.
-
-## Scoring and Run Quality
-
-By default, candidates are ranked with this multiplicative score:
-
-```text
-Score =
-  Density^1.00
-  x PeakRelief^1.00
-  x Extent^0.35
-  x Support^0.40
-  x Prominence^0.75
-  x Compactness^0.20
-  x Solidity^0.20
-  x Area^0.50
+```
+runs/<run_name>/
+├── dtm.tif                      DTM raster
+├── lrm.tif                      Local Relief Model (NaN where DTM is void)
+├── mound_density.tif            Smoothed candidate-density surface
+├── candidates.csv               All candidates with metrics and scores
+├── candidates.geojson           Centroids as GeoJSON Points (WGS84)
+├── candidate_regions.geojson    Bounding-box Polygons (WGS84) — load in QGIS
+├── candidates.kml               KML for Google Earth, labeled by rank
+├── report.html                  Interactive Leaflet report (open in browser)
+├── report.md / report.pdf       Plain text and PDF summaries
+├── plots/                       Density overlay, score histograms, etc.
+├── html/img/                    LRM cutouts for each top candidate
+└── run_params.json              All resolved settings, thresholds, runtimes
 ```
 
-The score is only meaningful within a run. It is a ranking signal, not a calibrated probability.
+`candidate_labels.csv` is written when analyst labeling is used via the Streamlit app.
 
-The Streamlit app also reports a simple run-quality heuristic based on five checks:
+`runs/manifest.csv` accumulates one summary row per run across the project.
 
-1. `8 <= candidates <= 250`
-2. at least one non-noise cluster
-3. `top_score >= 2.0`
-4. `median_score >= 0.35`
-5. `noise / candidates <= 0.70`
+### Coordinate accuracy
 
-Quality badges such as `Strong`, `Moderate`, and `Weak/noisy` are meant for triage only.
+All output coordinates are WGS84 (EPSG:4326). Reported positions are region centroids. Horizontal accuracy is typically ±2–5× the input resolution and degrades further for large or irregular regions. Do not use these coordinates for field navigation or sub-meter survey work.
 
-## Data Sources
+---
 
-Public LiDAR datasets can be downloaded from [OpenTopography](https://opentopography.org/).
+## Scoring
 
-Typical workflow:
+Candidates are ranked by this multiplicative score:
 
-1. Download LAZ tiles for an area of interest
-2. Place them under `data/lidar/`
-3. Run MayaScan on the local files
+```
+Score =
+  Density^1.00
+  × PeakRelief^1.00
+  × Extent^0.35
+  × ConsensusSupport^0.40
+  × Prominence^0.75
+  × Compactness^0.20
+  × Solidity^0.20
+  × Area^0.50
+```
 
-MayaScan currently works on local input files only. No API key is required.
+The score is meaningful only for ranking within a single run. It is not a probability, not comparable across runs, and the exponents are heuristic — they have not been calibrated against confirmed archaeological features.
+
+The Streamlit app shows a **Triage quality** badge based on five parameter-output checks (candidate count in range, at least one cluster, score thresholds, noise fraction). This badge reflects whether the run's parameter settings produced a plausible output; it says nothing about whether real features are present.
+
+---
+
+## Key parameters
+
+### Where to start
+
+Use the **Balanced** preset and accept its defaults for a first pass. Review the HTML report map and candidate table. Adjust only if the results are clearly too sparse or too noisy.
+
+### Detection thresholds
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--pos-thresh auto:p96` | 96th LRM percentile | Raise to get fewer, stronger candidates. Lower to increase recall at cost of more noise. |
+| `--min-density auto:p60` | 60th density percentile | Lower if the tile is sparse or has few candidates. |
+| `--density-sigma 40` | 40 pixels | Controls how broadly candidate density is smoothed. |
+| `--max-slope-deg 20` | 20° (q75 slope) | Lower in very flat terrain; raise in sloped or hilly areas. |
+
+### If you get too few candidates
+
+Try `--pos-thresh auto:p95` and `--min-density auto:p50`. Relax shape filters: lower `--min-compactness` to 0.08, `--min-solidity` to 0.40, `--min-extent` to 0.30. If the tile is vegetation-dense, use `--try-smrf`.
+
+### If you get too many candidates (noisy output)
+
+Raise `--pos-thresh auto:p97`. Increase `--min-peak` to 0.60, `--min-compactness` to 0.16, `--min-solidity` to 0.58. Increase `--consensus-min-support` to 3.
+
+### Shape filters
+
+| Flag | Purpose |
+|---|---|
+| `--min-peak 0.50` | Minimum relief at the peak pixel (m). |
+| `--min-area-m2 25` / `--max-area-m2 1200` | Size bounds. Increase max for large platforms. |
+| `--min-extent 0.38` | Bbox fill ratio [0,1]; suppresses elongated blobs. |
+| `--max-aspect 3.5` | Long/short axis ratio; suppresses ridges and walls. |
+| `--min-prominence 0.10` | Peak minus surrounding-ring mean (m). |
+| `--min-compactness 0.12` | Circularity 4πA/P² [0,1]; suppresses linear features. |
+| `--min-solidity 0.50` | Area / convex-hull area [0,1]; suppresses fragmented shapes. |
+| `--edge-buffer-m 10` | Drop regions within this distance of the tile edge. |
+| `--min-spacing-m 15` | Score-ordered deduplication radius. |
+
+### Consensus
+
+| Flag | Purpose |
+|---|---|
+| `--consensus-percentiles 95,96,97` | Threshold levels to run. |
+| `--consensus-min-support 2` | Minimum number of runs that must agree. |
+| `--consensus-radius-m 12` | Centroid-distance guard (overlap is the primary criterion). |
+| `--no-consensus` | Disable consensus entirely for a single-threshold run. |
+
+### Clustering
+
+| Flag | Purpose |
+|---|---|
+| `--cluster-eps auto` | DBSCAN radius, estimated from k-distance knee. Use a fixed value (meters) if auto gives bad results. |
+| `--min-samples 4` | Minimum candidates to form a cluster. |
+
+---
+
+## Synthetic validation
+
+`tests/make_synthetic_lidar.py` generates a controlled point cloud: 500×500 m at UTM 16N, with 15 Gaussian mounds at known positions (amplitudes 0.33–0.62 m, σ = 3–6 m) and 2 elongated ridge traps that should not be detected.
+
+```bash
+python tests/make_synthetic_lidar.py
+python maya_scan.py \
+  -i data/lidar/synthetic_mounds.las \
+  --name synth_validation \
+  --overwrite \
+  --try-smrf \
+  --validate-against data/synthetic_mounds_truth.csv \
+  --validate-match-radius-m 8
+```
+
+With default Balanced parameters: **14/15 mounds detected (93% recall), 0 false positives** from the ridge traps. The missed mound (M6) is adjacent to a long ridge whose shape leaks into M6's bounding box, causing it to fail the compactness filter — this is correct behavior.
+
+**What this proves:** The detection pipeline is internally consistent and the shape filters effectively suppress elongated features.
+
+**What this does not prove:** Performance on real archaeological data. The synthetic mounds were sized to match the default parameters. False-positive and false-negative rates on real sites are unknown and must be measured against confirmed features before operational use.
+
+---
+
+## Data sources
+
+Public LiDAR for Maya lowlands can be downloaded from [OpenTopography](https://opentopography.org/). Download LAZ tiles, place them under `data/lidar/`, and run MayaScan locally. No API key is required.
+
+---
 
 ## Limitations
 
-- MayaScan does not confirm archaeological features; it only prioritizes anomalies.
-- Scores are relative within a run and should not be interpreted as probabilities.
-- Strict consensus settings can suppress isolated true positives.
-- False positives are more common in rugged terrain, modern earthworks, and heavily modified landscapes.
-- Output quality depends on point-cloud quality, ground classification quality, and parameter choice.
-- Analyst labels are review metadata, not training labels.
-- The current workflow is mainly tuned for single-tile or tile-at-a-time analysis.
+- MayaScan detects terrain anomalies, not confirmed sites.
+- Scores are meaningless across runs and should not be treated as probabilities.
+- False-positive rates are elevated in karst topography, modern earthworks, tree-throw mounds, and heavily disturbed landscapes.
+- Consensus filtering reduces noise but can suppress isolated mounds, which are common in dispersed settlement zones.
+- DTM quality depends on ground classification. Poor SMRF results produce poor LRMs.
+- Results are per-tile; features near tile edges or split across tiles may be missed or duplicated.
+- **False-positive and false-negative rates on real archaeological data have not been quantified.**
+- **The multi-scale LRM max-fusion operator is novel and unvalidated in peer-reviewed literature.**
+- **Scoring exponents are heuristic** and have not been calibrated against confirmed features.
+- Coordinate centroids carry ±2–5× resolution horizontal uncertainty.
+- If the input tile spans a UTM zone boundary, clustering distances and coordinate exports may be slightly inaccurate.
 
-## Future Work
+---
 
-- multi-tile regional analysis
-- linear-feature detection
-- automated parameter adaptation from diagnostics and analyst feedback
+## Repository layout
 
-## Repository Layout
-
-```text
+```
 MayaScan/
-├── app.py
-├── maya_scan.py
+├── app.py                   Streamlit review app
+├── maya_scan.py             CLI pipeline
 ├── README.md
 ├── requirements.txt
 ├── LICENSE
@@ -305,47 +346,74 @@ MayaScan/
 │   ├── mayascan_logo.svg
 │   ├── caracol_caana.png
 │   └── aguada_fenix_lidar.png
+├── tests/
+│   └── make_synthetic_lidar.py   Generates synthetic tile for validation
 └── data/
     └── lidar/
         ├── .gitkeep
-        └── sample.laz
+        └── bz_lr_las47_crs.laz   Default tile — 4.4 km from Caracol monumental core
 ```
 
-Generated outputs under `runs/` and local LiDAR files under `data/lidar/` are typically gitignored, except for the bundled sample tile.
+`runs/` and `data/lidar/*.las/.laz` are gitignored.
 
-## Tech Stack
+---
 
-- Python
-- NumPy, SciPy, Pandas
-- Rasterio, PyProj, Shapely
-- PDAL
-- scikit-learn
-- Matplotlib, ReportLab
-- Streamlit
+## Tech stack
 
-## Development Note
+| Library | Role |
+|---|---|
+| PDAL | Point cloud ingestion, SMRF ground classification, DTM rasterization |
+| NumPy / SciPy | Raster arithmetic, Gaussian filtering, morphological ops, clustering |
+| Rasterio | GeoTIFF read/write with CRS and affine transform support |
+| PyProj / Shapely | CRS reprojection, WGS84 coordinate conversion, polygon geometry |
+| scikit-learn | DBSCAN spatial clustering |
+| Pandas | Candidate tabulation and CSV export |
+| Matplotlib | Diagnostic plots and LRM cutouts |
+| ReportLab | PDF report rendering |
+| Streamlit | Interactive review and labeling app |
+| laspy | LAS file generation for synthetic test harness |
 
-Large language models were used for prototyping, debugging support, and documentation refinement. Method choices, parameter interpretation, and project validation were reviewed manually.
+---
+
+## Images
+
+<p align="center">
+  <img src="assets/caracol_caana.png" width="600" alt="Caana pyramid at Caracol, Belize">
+</p>
+<p align="center"><em>Caana pyramid at Caracol, Belize — the type of architecture MayaScan is designed to help locate in dense forest</em></p>
+
+<p align="center">
+  <img src="assets/aguada_fenix_lidar.png" width="600" alt="LiDAR terrain model of Aguada Fenix, Mexico">
+</p>
+<p align="center"><em>Aguada Fénix revealed by LiDAR — a large Maya reservoir invisible on the ground surface</em></p>
+
+---
+
+## Development note
+
+Large language models were used for prototyping, debugging, and documentation. Method choices, parameter interpretation, and validation were reviewed manually.
+
+---
 
 ## License
 
-This project is licensed under the MIT License. See [`LICENSE`](LICENSE) for details.
+MIT License. See [`LICENSE`](LICENSE) for details.
+
+---
 
 ## Author
 
 **James Adelhelm**  
-Software Developer on the Data Ingest team at AccuWeather.
+Software Developer, Data Ingest team, AccuWeather
 
-MayaScan is an independent personal research and software project driven by an interest in Maya history. It is not affiliated with, endorsed by, or sponsored by AccuWeather.
+MayaScan is an independent personal research project driven by interest in Maya history. It is not affiliated with, endorsed by, or sponsored by AccuWeather.
 
-## Image Credits
+---
 
-**Caana, Caracol (Belize)**  
-Photo by Devon Jones - Wikimedia Commons  
-License: CC BY-SA 3.0  
+## Image credits
+
+**Caana, Caracol (Belize)** — Devon Jones, Wikimedia Commons, CC BY-SA 3.0  
 <https://commons.wikimedia.org/wiki/File:Caracol-Temple.jpg>
 
-**Aguada Fenix LiDAR**  
-Courtesy of Takeshi Inomata - Wikimedia Commons  
-License: CC BY-SA 4.0  
+**Aguada Fénix LiDAR** — Takeshi Inomata, Wikimedia Commons, CC BY-SA 4.0  
 <https://commons.wikimedia.org/wiki/File:Aguada_F%C3%A9nix_1.jpg>

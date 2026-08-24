@@ -57,6 +57,7 @@ import html
 import json
 import logging
 import math
+import os
 import time
 import re
 import shutil
@@ -116,6 +117,30 @@ def setup_logging(out_dir: Path) -> None:
     LOG.info("Logging to %s", log_path)
 
 
+def configure_runtime_cache_dirs(out_dir: Path) -> None:
+    """
+    Keep plotting/font caches inside the runs directory.
+
+    Some execution environments have a read-only or non-writable home cache.
+    Matplotlib/fontconfig can otherwise spend a long time trying to build
+    caches there, or fail during plot/report generation.
+    """
+    cache_root = out_dir.parent / ".mayascan_cache"
+    mpl_cache = cache_root / "matplotlib"
+    xdg_cache = cache_root / "xdg"
+    for path in (mpl_cache, xdg_cache):
+        path.mkdir(parents=True, exist_ok=True)
+
+    os.environ.setdefault("MPLCONFIGDIR", str(mpl_cache))
+    os.environ.setdefault("XDG_CACHE_HOME", str(xdg_cache))
+
+    LOG.info(
+        "Runtime cache dirs: MPLCONFIGDIR=%s | XDG_CACHE_HOME=%s",
+        os.environ["MPLCONFIGDIR"],
+        os.environ["XDG_CACHE_HOME"],
+    )
+
+
 def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> None:
     proc = subprocess.run(
         cmd,
@@ -137,6 +162,15 @@ def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> None:
 @dataclass
 class Params:
     dtm_resolution_m: float = 1.0
+
+    # SMRF ground-classification parameters (used only when --try-smrf is set).
+    # Defaults match PDAL recommendations for low-relief tropical terrain.
+    # Increase smrf_scalar / smrf_slope for rougher terrain; decrease smrf_window
+    # for denser vegetation or finer detail.
+    smrf_scalar: float = 1.25
+    smrf_slope: float = 0.15
+    smrf_threshold: float = 0.5
+    smrf_window: float = 16.0
 
     # Multi-scale LRM sigmas (pixels)
     lrm_sigmas_small: Tuple[float, ...] = (1.0, 2.0)
@@ -168,8 +202,18 @@ class Params:
     min_candidate_spacing_m: float = 15.0  # score-ordered de-dup spacing between candidate centers
     prominence_ring_pixels: int = 6        # ring width (pixels) for local prominence estimate
     min_prominence_m: float = 0.10         # region mean relief - local ring mean relief
-    min_compactness: float = 0.12          # 4*pi*A/P^2 in [0,1], lower = line-like
+    min_compactness: float = 0.20          # 4*pi*A/P^2 in [0,1], lower = line-like
     min_solidity: float = 0.50             # A / convex_hull_A in [0,1], lower = fragmented/linear
+    max_peak_offset_ratio: float = 0.60   # dist(centroid→peak)/sqrt(area_pix); >0.6 ≈ ridge/slope face
+
+    # Topographic Position Index — suppresses ridge-crest false positives
+    tpi_radius_m: float = 50.0            # neighbourhood radius; larger = coarser regional context
+    max_tpi_m: float = 0.0               # 0 = disabled; ridge crests score >2 m, flat terrain <0.5 m
+
+    # Depression detection (aguadas, plazas, quarries — negative-relief features)
+    detect_depressions: bool = False
+    neg_relief_threshold_spec: str = "auto:p96"   # applied to -LRM
+    min_depression_depth_m: float = 0.20           # minimum absolute depth (equiv of min_peak for mounds)
 
     # Clustering
     cluster_eps_m: float = 150.0
@@ -196,6 +240,17 @@ class Params:
     score_solidity_exp: float = 0.20
     score_area_exp: float = 0.50
 
+
+# Floor values used in score computation to prevent zero/negative inputs to
+# power operations. Kept as named constants so the intent is self-documenting.
+_SCORE_FLOOR_DENSITY: float = 1e-9
+_SCORE_FLOOR_PEAK: float = 1e-9
+_SCORE_FLOOR_EXTENT: float = 1e-6
+_SCORE_FLOOR_CONSENSUS: float = 1.0
+_SCORE_FLOOR_PROMINENCE: float = 1e-6
+_SCORE_FLOOR_COMPACTNESS: float = 1e-6
+_SCORE_FLOOR_SOLIDITY: float = 1e-6
+_SCORE_FLOOR_AREA: float = 1e-9
 
 _RUN_NAME_BAD_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _AUTO_PERCENTILE_RE = re.compile(r"^auto:p([0-9]+(?:\.[0-9]+)?)$", re.IGNORECASE)
@@ -346,12 +401,87 @@ def pdal_version() -> str:
         return "pdal (unknown)"
 
 
+def query_point_cloud_info(laz_path: Path) -> Dict[str, Any]:
+    """Run pdal info --summary and return parsed JSON, or {} on failure."""
+    try:
+        proc = subprocess.run(
+            ["pdal", "info", "--summary", str(laz_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            return {}
+        return json.loads(proc.stdout or "{}")
+    except Exception:
+        return {}
+
+
+def check_point_cloud_density(laz_path: Path, dtm_resolution_m: float) -> Optional[float]:
+    """
+    Return approximate point density (pts/m²) or None if unavailable.
+    Warns if density is too low for the chosen DTM resolution.
+    Assumes the source CRS is metric (typical for pre-processed LAZ tiles).
+    """
+    info = query_point_cloud_info(laz_path)
+    summary = info.get("summary", {})
+    num_points = summary.get("num_points") or summary.get("numPoints")
+    bounds = summary.get("bounds", {})
+
+    if num_points is None or not bounds:
+        LOG.info("Point cloud density check skipped (pdal info returned no summary data)")
+        return None
+
+    try:
+        dx = float(bounds.get("maxx", 0)) - float(bounds.get("minx", 0))
+        dy = float(bounds.get("maxy", 0)) - float(bounds.get("miny", 0))
+        area_m2 = dx * dy
+    except (TypeError, ValueError):
+        return None
+
+    if area_m2 <= 0:
+        return None
+
+    density = float(num_points) / area_m2
+    LOG.info(
+        "Point cloud: %d points | tile area ~%.0f m² | density ~%.2f pts/m²",
+        int(num_points), area_m2, density,
+    )
+
+    if density < 1.0:
+        msg = (
+            f"Point cloud density is very low ({density:.2f} pts/m²). "
+            f"A reliable {dtm_resolution_m:.1f} m DTM typically needs ≥4 pts/m². "
+            "Results are likely unreliable — consider a coarser resolution or "
+            "a better-covered tile."
+        )
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
+    elif density < 4.0:
+        msg = (
+            f"Point cloud density is marginal ({density:.2f} pts/m²) for a "
+            f"{dtm_resolution_m:.1f} m DTM. Consider --resolution-m 2 or "
+            "verify point coverage before interpreting results."
+        )
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
+    else:
+        LOG.info("Point cloud density adequate for %.1f m resolution (%.2f pts/m²)", dtm_resolution_m, density)
+
+    return density
+
+
 def build_dtm_from_laz(
     laz_path: Path,
     out_dtm_tif: Path,
     tmp_dir: Path,
     resolution_m: float,
     try_smrf: bool,
+    smrf_scalar: float = 1.25,
+    smrf_slope: float = 0.15,
+    smrf_threshold: float = 0.5,
+    smrf_window: float = 16.0,
 ) -> None:
     """
     Robust PDAL approach:
@@ -369,16 +499,20 @@ def build_dtm_from_laz(
 
     if try_smrf:
         smrf_out = tmp_dir / "ground_smrf.las"
+        LOG.info(
+            "SMRF params: scalar=%.3f slope=%.3f threshold=%.3f window=%.1f",
+            smrf_scalar, smrf_slope, smrf_threshold, smrf_window,
+        )
         smrf_json = {
             "pipeline": [
                 {"type": "readers.las", "filename": str(in_path)},
                 {
                     "type": "filters.smrf",
                     "ignore": "Classification[7:7]",
-                    "scalar": 1.25,
-                    "slope": 0.15,
-                    "threshold": 0.5,
-                    "window": 16.0,
+                    "scalar": float(smrf_scalar),
+                    "slope": float(smrf_slope),
+                    "threshold": float(smrf_threshold),
+                    "window": float(smrf_window),
                 },
                 {"type": "writers.las", "filename": str(smrf_out)},
             ]
@@ -444,12 +578,12 @@ def _res_m_from_profile(profile: Dict[str, Any]) -> float:
     return float((resx + resy) / 2.0)
 
 
-def write_float_geotiff(path: Path, arr: np.ndarray, base_profile: Dict[str, Any]) -> None:
+def write_float_geotiff(path: Path, arr: np.ndarray, base_profile: Dict[str, Any], nodata: Optional[float] = None) -> None:
     prof = dict(base_profile)
     prof.update(
         dtype="float32",
         count=1,
-        nodata=None,
+        nodata=nodata,
         compress="deflate",
         tiled=True,
         blockxsize=256,
@@ -469,6 +603,33 @@ def compute_slope_degrees(dtm: np.ndarray, res_m: float) -> np.ndarray:
     return np.degrees(slope_rad).astype("float32")
 
 
+def compute_tpi(dtm: np.ndarray, radius_m: float, res_m: float) -> np.ndarray:
+    """Topographic Position Index = DTM − mean(DTM within radius_m neighbourhood).
+
+    Positive TPI identifies ridge crests and hilltops; near-zero identifies flat
+    terrain and midslopes; negative identifies valley bottoms.
+
+    Uses a Gaussian-weighted neighbourhood (sigma = radius_m / 2) rather than a
+    hard disk so the filter stays separable and fast on large rasters.
+    """
+    sigma_pix = max(1.0, (radius_m / res_m) / 2.0)
+    valid = np.isfinite(dtm)
+    filled = np.where(valid, dtm, 0.0).astype("float32")
+    weight = valid.astype("float32")
+    smoothed = gaussian_filter(filled, sigma=sigma_pix, mode="nearest")
+    weight_sm = gaussian_filter(weight, sigma=sigma_pix, mode="nearest")
+    mean_surround = np.where(weight_sm > 0.1, smoothed / weight_sm, np.nan)
+    return np.where(valid, (dtm - mean_surround), np.nan).astype("float32")
+
+
+def check_dtm_coverage(dtm: np.ndarray) -> Tuple[int, int, float]:
+    """Return (valid_pixels, total_pixels, coverage_fraction) for the DTM."""
+    total = int(dtm.size)
+    valid = int(np.sum(np.isfinite(dtm)))
+    frac = float(valid) / max(1, total)
+    return valid, total, frac
+
+
 def hillshade(dtm: np.ndarray, res_m: float, azimuth_deg: float = 315.0, altitude_deg: float = 45.0) -> np.ndarray:
     fill = np.nanmedian(dtm)
     z = np.where(np.isnan(dtm), fill, dtm).astype("float32")
@@ -485,21 +646,40 @@ def hillshade(dtm: np.ndarray, res_m: float, azimuth_deg: float = 315.0, altitud
 # LRM
 # -----------------------------
 def build_multiscale_lrm(dtm: np.ndarray, params: Params) -> np.ndarray:
+    # Each (small, large) sigma pair computes a Gaussian-difference bandpass that
+    # isolates surface variation at a specific spatial scale.  At 1 m/px the
+    # defaults (small: 1–2 px, large: 8–16 px) target features whose footprints
+    # span roughly 5–200 m² — consistent with Maya platform and low-mound sizes
+    # (Chase et al. 2010; Evans et al. 2013).  Small sigma preserves sharp edges;
+    # large sigma provides a regional background estimate that removes broad slopes.
+    #
+    # The maximum across all pairs is retained at each pixel so that each location
+    # is represented by whichever scale produces the strongest relief contrast.
+    # This is a novel fusion strategy without peer-reviewed validation; users
+    # should sanity-check results against known features before drawing conclusions.
+    nodata_mask = ~np.isfinite(dtm)
     fill = np.nanmedian(dtm)
-    dtm_f = np.where(np.isnan(dtm), fill, dtm).astype("float32")
+    dtm_f = np.where(nodata_mask, fill, dtm).astype("float32")
 
     lrms: List[np.ndarray] = []
     for s_small in params.lrm_sigmas_small:
-        small = gaussian_filter(dtm_f, sigma=s_small)
+        # mode='nearest' extends edge values outward instead of reflecting the
+        # raster back inward, which prevents mirror-image artifacts in the LRM
+        # near tile boundaries — a common false-positive source in low-relief terrain.
+        small = gaussian_filter(dtm_f, sigma=s_small, mode="nearest")
         for s_large in params.lrm_sigmas_large:
             if s_large <= s_small:
                 continue
-            large = gaussian_filter(dtm_f, sigma=s_large)
+            large = gaussian_filter(dtm_f, sigma=s_large, mode="nearest")
             lrms.append(small - large)
 
     if not lrms:
         raise RuntimeError("No valid sigma pairs for LRM")
-    return np.maximum.reduce(lrms).astype("float32")
+    result = np.maximum.reduce(lrms).astype("float32")
+    # Restore NoData mask so the LRM GeoTiff carries proper NaN coverage
+    # and GIS tools handle data-gap areas correctly.
+    result[nodata_mask] = np.nan
+    return result
 
 
 def parse_auto_percentile(spec: str, values: np.ndarray, positive_only: bool = True) -> float:
@@ -540,6 +720,7 @@ class Candidate:
     prominence_m: float        # mean relief over region minus local ring mean
     compactness: float         # 4*pi*A/P^2 in [0,1]
     solidity: float            # A / convex_hull_A in [0,1]
+    peak_offset_ratio: float   # dist(centroid, peak_pixel) / sqrt(area_pix); low = dome-like
     width_m: float
     height_m: float
     score: float
@@ -548,6 +729,12 @@ class Candidate:
     cluster_id: int = -1
     dist_to_core_km: Optional[float] = None  # distance to densest candidate within the same cluster
     img_relpath: Optional[str] = None
+    feature_type: str = "mound"  # "mound" or "depression"
+    # Bounding-box in raster pixel coords (used for polygon export)
+    bbox_px_x0: int = 0
+    bbox_px_y0: int = 0
+    bbox_px_x1: int = 0
+    bbox_px_y1: int = 0
 
 
 def _region_perimeter_pixels(region_mask: np.ndarray) -> float:
@@ -749,8 +936,20 @@ def _extract_candidate_regions(
         if slope_q75_deg > params.max_slope_deg:
             continue
 
-        peak = float(np.nanmax(lrm[region]))
-        mean = float(np.nanmean(lrm[region]))
+        region_lrm_vals = lrm[ys, xs]
+        peak = float(np.nanmax(region_lrm_vals))
+        mean = float(np.nanmean(region_lrm_vals))
+
+        # Peak centrality: distance from centroid to the LRM-peak pixel,
+        # normalized by sqrt(area_pixels).  Values near 0 indicate a dome-
+        # like mound; values approaching 1+ suggest the peak is at the edge
+        # (a ridge segment, tree-throw cluster, or elongated false positive).
+        peak_local_idx = int(np.nanargmax(region_lrm_vals))
+        peak_col = float(xs[peak_local_idx])
+        peak_row = float(ys[peak_local_idx])
+        peak_offset_ratio = float(
+            math.hypot(peak_col - cx, peak_row - cy) / max(1.0, math.sqrt(float(pix)))
+        )
         ring_iters = max(1, int(params.prominence_ring_pixels))
         ring_mask = binary_dilation(region, iterations=ring_iters) & ~region
         ring_vals = lrm[ring_mask]
@@ -804,6 +1003,7 @@ def _extract_candidate_regions(
                 "slope_median_deg": slope_median_deg,
                 "slope_q75_deg": slope_q75_deg,
                 "slope_max_deg": slope_max_deg,
+                "peak_offset_ratio": peak_offset_ratio,
             }
         )
         kept_rids.append(rid)
@@ -823,7 +1023,10 @@ def build_density_from_regions(
     density = gaussian_filter(mound_binary, sigma=float(params.density_sigma_pix)).astype("float32")
     dmin = float(np.min(density))
     dmax = float(np.max(density))
-    density_norm = ((density - dmin) / (dmax - dmin + 1e-9)).astype("float32")
+    if np.isclose(dmin, dmax):
+        density_norm = np.ones_like(density, dtype="float32")
+    else:
+        density_norm = ((density - dmin) / (dmax - dmin)).astype("float32")
 
     write_float_geotiff(out_density_tif, density_norm, profile)
     LOG.info("Wrote density raster: %s", out_density_tif)
@@ -938,6 +1141,52 @@ def _utm_epsg_from_lonlat(lon: float, lat: float) -> int:
     return (32600 + zone) if lat >= 0 else (32700 + zone)
 
 
+def _check_utm_zone_boundary(dtm: np.ndarray, dtm_prof: Dict[str, Any], src_crs: CRS) -> None:
+    """Warn when the DTM footprint crosses a UTM zone boundary or the equator.
+
+    Both conditions mean that a single UTM zone cannot represent all corners of
+    the tile without metric distortion.  The DBSCAN clustering step and the
+    centroid coordinates in CSV/KML outputs will be slightly off near the seam.
+    """
+    H, W = dtm.shape
+    t = dtm_prof["transform"]
+    corners_src = [
+        (t.c,               t.f),
+        (t.c + W * t.a,     t.f),
+        (t.c,               t.f + H * t.e),
+        (t.c + W * t.a,     t.f + H * t.e),
+    ]
+    to_ll = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
+    lons = []
+    lats = []
+    for cx, cy in corners_src:
+        lon, lat = to_ll.transform(cx, cy)
+        lons.append(lon)
+        lats.append(lat)
+
+    zone_nums = {int(math.floor((lon + 180.0) / 6.0)) for lon in lons}
+    if len(zone_nums) > 1:
+        msg = (
+            f"DTM footprint spans a UTM zone boundary "
+            f"(lon {min(lons):.3f}° to {max(lons):.3f}°, zones {sorted(zone_nums)}). "
+            "DBSCAN clustering distances and metric coordinate exports may be "
+            "inaccurate near the boundary. Consider splitting the tile or using "
+            "a custom equal-area CRS."
+        )
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
+
+    if min(lats) < 0.0 < max(lats):
+        msg = (
+            "DTM footprint crosses the equator "
+            f"(lat {min(lats):.3f}° to {max(lats):.3f}°). "
+            "UTM hemisphere codes differ across the equator; verify that output "
+            "coordinates near lat=0 are correct."
+        )
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
+
+
 def _projected_unit_factor_to_meters(src_crs: CRS) -> Optional[float]:
     factors: List[float] = []
     for axis in src_crs.axis_info:
@@ -1047,7 +1296,9 @@ def dedupe_candidates_by_spacing(
 
 def cluster_candidates_meters(xs_m: np.ndarray, ys_m: np.ndarray, params: Params) -> np.ndarray:
     if DBSCAN is None:
-        LOG.warning("sklearn not installed; clustering disabled (cluster_id=-1).")
+        msg = "sklearn not installed; clustering disabled (cluster_id=-1)."
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
         return np.full(xs_m.shape[0], -1, dtype=int)
 
     coords = np.column_stack([xs_m, ys_m]).astype("float32")
@@ -1132,13 +1383,79 @@ def write_geojson(candidates: List[Candidate], out_path: Path) -> None:
                     "prominence_m": c.prominence_m,
                     "compactness": c.compactness,
                     "solidity": c.solidity,
+                    "peak_offset_ratio": c.peak_offset_ratio,
                     "width_m": c.width_m,
                     "height_m": c.height_m,
                     "cluster_id": c.cluster_id,
                     "dist_to_core_km": c.dist_to_core_km,
+                    "feature_type": c.feature_type,
                 },
             }
         )
+    out_path.write_text(json.dumps({"type": "FeatureCollection", "features": feats}, indent=2), encoding="utf-8")
+
+
+def write_regions_geojson(
+    candidates: List[Candidate],
+    dtm_transform: Any,
+    transformer_ll: Transformer,
+    out_path: Path,
+) -> None:
+    """
+    Export candidate detected regions as bounding-box Polygon features.
+    Polygons are the pixel-space bounding boxes of connected components,
+    converted to WGS84 corner coordinates. Useful for visual QA in QGIS/ArcGIS
+    and for comparing detected shape to the LRM raster.
+    """
+    feats = []
+    for c in candidates:
+        # Corner pixels of the bounding box; each corner is the pixel *center*.
+        # We offset by ±0.5 pixel to represent the outer edge of the bounding cells.
+        # pix2map_xy expects (row, col) = (y, x).
+        x0, y0, x1, y1 = c.bbox_px_x0, c.bbox_px_y0, c.bbox_px_x1, c.bbox_px_y1
+        # Four outer corners (top-left, top-right, bottom-right, bottom-left)
+        # using pixel-edge offsets so the polygon encloses the full pixel footprint.
+        corners_rc = [
+            (y0 - 0.5, x0 - 0.5),
+            (y0 - 0.5, x1 + 0.5),
+            (y1 + 0.5, x1 + 0.5),
+            (y1 + 0.5, x0 - 0.5),
+        ]
+        ring = []
+        for (row, col) in corners_rc:
+            x_map, y_map = pix2map_xy(dtm_transform, row, col)
+            lon, lat = transformer_ll.transform(x_map, y_map)
+            ring.append([round(float(lon), 8), round(float(lat), 8)])
+        ring.append(ring[0])  # close the ring
+
+        feats.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [ring]},
+                "properties": {
+                    "cand_id": c.cand_id,
+                    "score": c.score,
+                    "density": c.density,
+                    "peak_relief_m": c.peak_relief_m,
+                    "area_m2": c.area_m2,
+                    "width_m": c.width_m,
+                    "height_m": c.height_m,
+                    "extent": c.extent,
+                    "aspect": c.aspect,
+                    "compactness": c.compactness,
+                    "solidity": c.solidity,
+                    "peak_offset_ratio": c.peak_offset_ratio,
+                    "prominence_m": c.prominence_m,
+                    "consensus_support": c.consensus_support,
+                    "cluster_id": c.cluster_id,
+                    "dist_to_core_km": c.dist_to_core_km,
+                    "feature_type": c.feature_type,
+                    "centroid_lon": c.lon,
+                    "centroid_lat": c.lat,
+                },
+            }
+        )
+
     out_path.write_text(json.dumps({"type": "FeatureCollection", "features": feats}, indent=2), encoding="utf-8")
 
 
@@ -1160,12 +1477,14 @@ def write_csv(candidates: List[Candidate], out_path: Path) -> None:
                 "prominence_m",
                 "compactness",
                 "solidity",
+                "peak_offset_ratio",
                 "width_m",
                 "height_m",
                 "lon",
                 "lat",
                 "cluster_id",
                 "dist_to_core_km",
+                "feature_type",
             ]
         )
         for c in candidates:
@@ -1183,12 +1502,14 @@ def write_csv(candidates: List[Candidate], out_path: Path) -> None:
                     f"{c.prominence_m:.4f}",
                     f"{c.compactness:.4f}",
                     f"{c.solidity:.4f}",
+                    f"{c.peak_offset_ratio:.4f}",
                     f"{c.width_m:.2f}",
                     f"{c.height_m:.2f}",
                     f"{c.lon:.8f}",
                     f"{c.lat:.8f}",
                     c.cluster_id,
                     "" if c.dist_to_core_km is None else f"{c.dist_to_core_km:.4f}",
+                    c.feature_type,
                 ]
             )
 
@@ -1215,7 +1536,7 @@ def write_clusters_csv(candidates: List[Candidate], out_path: Path) -> None:
 
 
 def _kml_escape(s: str) -> str:
-    return s.replace("&", "and").replace("<", "(").replace(">", ")")
+    return html.escape(s)
 
 
 def write_kml(candidates: List[Candidate], out_path: Path, label_top_n: int) -> None:
@@ -1264,7 +1585,7 @@ def write_kml(candidates: List[Candidate], out_path: Path, label_top_n: int) -> 
             "<Placemark>",
             f"<name>{_kml_escape(name)}</name>",
             f"<styleUrl>#{style}</styleUrl>",
-            f"<description>{desc}</description>",
+            f"<description><![CDATA[{desc}]]></description>",
             f"<Point><coordinates>{c.lon:.8f},{c.lat:.8f},0</coordinates></Point>",
             "</Placemark>",
         ]
@@ -1287,6 +1608,9 @@ def write_kml(candidates: List[Candidate], out_path: Path, label_top_n: int) -> 
 # Plots + report
 # -----------------------------
 def make_plots(out_dir: Path, lrm: np.ndarray, density: np.ndarray, candidates: List[Candidate]) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
     plots_dir = out_dir / "plots"
@@ -1511,7 +1835,7 @@ def write_report_md(
     md.append("- Slope filter uses **region slope q75** (not centroid slope).")
     md.append("- Candidate density uses **region mean density** over each connected region.")
     md.append("- Clustering/distances are done in **meters** (auto-UTM if source CRS is geographic).")
-    md.append("- KML ‘All Candidates’ dots have label scale=0 to prevent Google Earth text overload.")
+    md.append("- KML 'All Candidates' dots have label scale=0 to prevent Google Earth text overload.")
     md.append("")
 
     out_path = out_dir / "report.md"
@@ -1521,7 +1845,9 @@ def write_report_md(
 
 def write_report_pdf(md_path: Path, pdf_path: Path) -> None:
     if canvas is None:
-        LOG.warning("reportlab not installed; skipping PDF report.")
+        msg = "reportlab not installed; skipping PDF report."
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
         return
 
     text = md_path.read_text(encoding="utf-8").splitlines()
@@ -1579,14 +1905,29 @@ def write_run_params_json(
     dropped_spacing: int,
     candidate_count: int,
     stage_metrics: Optional[Dict[str, float]] = None,
+    dtm_coverage: Optional[float] = None,
+    point_density: Optional[float] = None,
 ) -> Path:
+    input_file_meta: Dict[str, Any] = {}
+    try:
+        st = input_path.stat()
+        input_file_meta = {
+            "size_bytes": int(st.st_size),
+            "mtime_utc": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    except OSError:
+        pass
+
     payload: Dict[str, Any] = {
         "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "run_name": run_name,
         "input_path": str(input_path),
+        "input_file": input_file_meta,
         "pdal_version": pdal_ver,
         "source_crs": src_crs.to_string(),
         "clustering_crs": None if clustering_crs is None else clustering_crs.to_string(),
+        "dtm_coverage_fraction": None if dtm_coverage is None else round(float(dtm_coverage), 6),
+        "point_density_per_m2": None if point_density is None else round(float(point_density), 4),
         "resolved_thresholds": {
             "pos_relief_m": float(pos_thresh),
             "min_density": float(min_density),
@@ -1632,6 +1973,9 @@ def generate_candidate_panels(
     top_n: int,
     res_m: float,
 ) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
     img_dir = out_dir / "html" / "img"
@@ -1703,6 +2047,7 @@ def write_html_report(
     params: Params,
     pos_thresh: float,
     min_density: float,
+    validation_results: Optional[Dict[str, Any]] = None,
 ) -> Path:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -1739,11 +2084,26 @@ def write_html_report(
                 "lat": c.lat,
                 "lon": c.lon,
                 "img": c.img_relpath or "",
+                "feature_type": c.feature_type,
             }
         )
 
     html_path = out_dir / "report.html"
     s_points = json.dumps(points)
+
+    # Serialize known-site data for Leaflet overlay
+    known_site_js: List[Dict[str, Any]] = []
+    if validation_results:
+        for s in validation_results.get("per_site", []):
+            known_site_js.append({
+                "name": s["name"],
+                "lat": s["lat"],
+                "lon": s["lon"],
+                "hit": s["hit"],
+                "matched_rank": s.get("matched_rank"),
+                "dist_m": s.get("dist_m"),
+            })
+    s_known = json.dumps(known_site_js)
 
     doc = f"""<!doctype html>
 <html><head><meta charset='utf-8'/>
@@ -1801,6 +2161,12 @@ details.card summary {{ cursor: pointer; font-weight: 600; }}
 </head><body><div class='wrap'>
 <h1>MayaScan Report — {html.escape(run_name)}</h1>
 <div class='small'>Timestamp: <b>{ts}</b> &nbsp;|&nbsp; Input: <code>{html.escape(str(input_path))}</code></div>
+<div style='background:#fef3c7;border:1px solid #d97706;border-radius:6px;padding:10px 14px;margin:10px 0;font-size:0.82em;color:#78350f'>
+  <strong>Triage aid — not confirmed sites.</strong>
+  Candidates are terrain anomalies ranked by geomorphic metrics. Scores are relative within this run only and have no absolute meaning.
+  Archaeological interpretation and field verification are required before any candidate can be treated as a confirmed feature.
+  False-positive rates are unknown and may be high in disturbed or karst terrain.
+</div>
 <div class='topnote small'>
 pos_relief_threshold: <b>{pos_thresh:.4f} m</b> ({html.escape(params.pos_relief_threshold_spec)}) &nbsp;|&nbsp;
 min_density: <b>{min_density:.4f}</b> ({html.escape(params.min_density_spec)}) &nbsp;|&nbsp;
@@ -1840,10 +2206,53 @@ KML labels: top <b>{params.kml_label_top_n}</b>
   </details>
 </div>
 
+<details class='card' style='margin-top:14px'>
+  <summary>Score formula</summary>
+  <p class='small' style='margin:10px 0 4px 0'>
+    <code>Score = density<sup>{params.score_density_exp:g}</sup>
+    &times; peak_relief<sup>{params.score_peak_exp:g}</sup>
+    &times; extent<sup>{params.score_extent_exp:g}</sup>
+    &times; consensus_support<sup>{params.score_consensus_exp:g}</sup>
+    &times; prominence<sup>{params.score_prominence_exp:g}</sup>
+    &times; compactness<sup>{params.score_compactness_exp:g}</sup>
+    &times; solidity<sup>{params.score_solidity_exp:g}</sup>
+    &times; area_m2<sup>{params.score_area_exp:g}</sup></code>
+  </p>
+  <p class='small'>
+    Scores are <b>relative within this run only</b> — not calibrated probabilities.
+    Exponents are heuristic and have not been formally validated against archaeological ground truth.
+    Use scores for triage ordering, not as a measure of archaeological significance.
+  </p>
+</details>
+
 <div class='hr'></div>
 <h2>Top candidates</h2>
-<div class='small'>Click coordinates to open in Google Maps. Images show LRM + hillshade panels when available.</div>
+<div class='small'>
+  Coordinates: <b>WGS84 (EPSG:4326)</b>.
+  Reported positions are region centroids; horizontal accuracy is typically
+  <b>±2–5&times; the input resolution</b> and degrades for large or irregular regions.
+  Do not use for sub-meter field navigation.
+  Click a coordinate link to open in Google Maps.
+  Images show LRM + hillshade panels when available.
+</div>
 <div class='hr'></div>
+"""
+
+    if not top:
+        doc += """
+<div style='background:#fef9c3;border:1px solid #fde047;border-radius:12px;padding:16px 20px;margin:12px 0;'>
+  <b>No candidates passed all filters.</b>
+  This is usually a parameter issue, not an empty landscape. Try one or more of:
+  <ul style='margin:8px 0 0 0;line-height:1.8;'>
+    <li>Lower <code>--pos-thresh</code> (e.g. <code>auto:p94</code> or <code>auto:p93</code>)</li>
+    <li>Lower <code>--min-density</code> (e.g. <code>auto:p50</code>)</li>
+    <li>Lower <code>--min-peak</code> (e.g. <code>0.30</code>)</li>
+    <li>Reduce <code>--consensus-min-support</code> to <code>1</code> or pass <code>--no-consensus</code></li>
+    <li>Reduce <code>--min-area-m2</code> or <code>--min-extent</code></li>
+    <li>Verify the point cloud is ground-classified (consider <code>--try-smrf</code>)</li>
+    <li>Check <code>run_params.json</code> for per-stage drop counts to find the tightest filter</li>
+  </ul>
+</div>
 """
 
     for rank, c in enumerate(top, start=1):
@@ -1880,7 +2289,7 @@ KML labels: top <b>{params.kml_label_top_n}</b>
 <table>
 <thead>
 <tr>
-<th>rank</th><th>cand_id</th><th>score</th><th>dens</th><th>peak(m)</th><th>support</th><th>prom(m)</th><th>area(m²)</th><th>extent</th><th>aspect</th><th>compact</th><th>solidity</th><th>cluster</th><th>lat</th><th>lon</th>
+<th>rank</th><th>cand_id</th><th>type</th><th>score</th><th>dens</th><th>peak(m)</th><th>support</th><th>prom(m)</th><th>area(m²)</th><th>extent</th><th>aspect</th><th>compact</th><th>solidity</th><th>cluster</th><th>lat</th><th>lon</th>
 </tr>
 </thead>
 <tbody>
@@ -1891,6 +2300,7 @@ KML labels: top <b>{params.kml_label_top_n}</b>
             "<tr>"
             f"<td>{rank}</td>"
             f"<td>{c.cand_id}</td>"
+            f"<td>{'▼ dep' if c.feature_type == 'depression' else '▲ mnd'}</td>"
             f"<td>{c.score:.3f}</td>"
             f"<td>{c.density:.3f}</td>"
             f"<td>{c.peak_relief_m:.2f}</td>"
@@ -1916,7 +2326,7 @@ const points = {s_points};
 const map = L.map('map').setView([{center_lat:.8f}, {center_lon:.8f}], 14);
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
   maxZoom: 19,
-  attribution: '&copy; OpenStreetMap contributors'
+  attribution: '&copy; OpenStreetMap contributors | Coordinates: WGS84 (EPSG:4326)'
 }}).addTo(map);
 
 function radiusFromScore(score) {{
@@ -1933,7 +2343,9 @@ function colorFromCluster(cid) {{
 const bounds = [];
 points.forEach(p => {{
   const r = radiusFromScore(p.score);
-  const col = colorFromCluster(p.cluster);
+  const isDepression = p.feature_type === 'depression';
+  const col = isDepression ? '#0369a1' : colorFromCluster(p.cluster);
+  const typeLabel = isDepression ? '▼ Depression' : '▲ Mound candidate';
   const gmaps = `https://www.google.com/maps?q=${{p.lat}},${{p.lon}}`;
 
   let imgHtml = '';
@@ -1943,7 +2355,7 @@ points.forEach(p => {{
 
   const popup = `
     <div style="font-size:14px">
-      <b>Candidate ${{p.cand_id}}</b><br/>
+      <b>Candidate ${{p.cand_id}}</b> <span style="color:${{col}}">${{typeLabel}}</span><br/>
       score <b>${{p.score.toFixed(3)}}</b> | dens ${{p.density.toFixed(3)}}<br/>
       peak ${{p.peak.toFixed(2)}}m | support ${{p.support}} | prom ${{p.prominence.toFixed(2)}}m | area ${{Math.round(p.area)}} m²<br/>
       extent ${{p.extent.toFixed(2)}} | aspect ${{p.aspect.toFixed(2)}}<br/>
@@ -1957,9 +2369,10 @@ points.forEach(p => {{
   const marker = L.circleMarker([p.lat, p.lon], {{
     radius: r,
     color: col,
-    weight: 2,
+    weight: isDepression ? 2.5 : 2,
     fillColor: col,
-    fillOpacity: 0.55
+    fillOpacity: isDepression ? 0.35 : 0.55,
+    dashArray: isDepression ? '4,3' : null,
   }}).addTo(map);
   marker.bindPopup(popup);
   bounds.push([p.lat, p.lon]);
@@ -1968,12 +2381,223 @@ points.forEach(p => {{
 if (bounds.length > 0) {{
   map.fitBounds(bounds, {{padding:[20,20]}});
 }}
-</script>
 
-</div></body></html>
+// Known-site markers (from --validate-against)
+const knownSites = {s_known};
+knownSites.forEach(s => {{
+  const col = s.hit ? '#16a34a' : '#dc2626';
+  const label = s.hit
+    ? `<b>${{s.name}}</b><br/>✓ Hit — rank ${{s.matched_rank}}, ${{s.dist_m}}m away`
+    : `<b>${{s.name}}</b><br/>✗ Not matched within radius`;
+  L.circleMarker([s.lat, s.lon], {{
+    radius: 8,
+    color: col,
+    weight: 2.5,
+    fillColor: col,
+    fillOpacity: 0.25,
+    dashArray: '4,3',
+  }}).addTo(map).bindPopup(`<div style="font-size:13px">${{label}}</div>`);
+}});
+</script>
 """
+
+    # Validation results section
+    if validation_results:
+        vr = validation_results
+        recall_pct = float(vr["recall"]) * 100.0
+        badge_color = "#16a34a" if recall_pct >= 70 else "#d97706" if recall_pct >= 40 else "#dc2626"
+        doc += f"""
+<div class='hr'></div>
+<h2>Validation results</h2>
+<div class='small' style='margin-bottom:10px'>
+  Known-site locations loaded from <code>--validate-against</code>.
+  A candidate within <b>{vr['match_radius_m']:.0f} m</b> of a site counts as a hit.
+  Green/red dashed circles on the map show hit/miss status.
+</div>
+<div class='kpis' style='grid-template-columns:repeat(5,minmax(0,1fr))'>
+  <div class='kpi'><span class='k'>Known sites</span><span class='v'>{vr['known_sites']}</span></div>
+  <div class='kpi'><span class='k'>Hits</span><span class='v' style='color:{badge_color}'>{vr['hits']}</span></div>
+  <div class='kpi'><span class='k'>Recall</span><span class='v' style='color:{badge_color}'>{recall_pct:.1f}%</span></div>
+  <div class='kpi'><span class='k'>Mean hit rank</span><span class='v'>{vr['mean_rank_of_hits'] or '—'}</span></div>
+  <div class='kpi'><span class='k'>Median hit rank</span><span class='v'>{vr['median_rank_of_hits'] or '—'}</span></div>
+</div>
+<div style='margin-top:10px' class='small'>
+  Hits in top-10: <b>{vr.get('hits_top_10', 0)}</b> &nbsp;|&nbsp;
+  top-25: <b>{vr.get('hits_top_25', 0)}</b> &nbsp;|&nbsp;
+  top-50: <b>{vr.get('hits_top_50', 0)}</b> &nbsp;|&nbsp;
+  top-100: <b>{vr.get('hits_top_100', 0)}</b>
+</div>
+<details class='card' style='margin-top:14px'>
+  <summary>Per-site match table</summary>
+  <div style='max-height:400px;overflow:auto;margin-top:8px'>
+  <table>
+  <thead><tr><th>site</th><th>hit</th><th>rank</th><th>dist (m)</th><th>score</th><th>lat</th><th>lon</th></tr></thead>
+  <tbody>
+"""
+        for s in vr.get("per_site", []):
+            hit_str = "✓" if s["hit"] else "✗"
+            hit_color = "#16a34a" if s["hit"] else "#dc2626"
+            doc += (
+                f"<tr>"
+                f"<td>{html.escape(str(s['name']))}</td>"
+                f"<td style='color:{hit_color};font-weight:600'>{hit_str}</td>"
+                f"<td>{s['matched_rank'] or '—'}</td>"
+                f"<td>{s['dist_m'] if s['dist_m'] is not None else '—'}</td>"
+                f"<td>{s['matched_score'] or '—'}</td>"
+                f"<td>{s['lat']:.6f}</td>"
+                f"<td>{s['lon']:.6f}</td>"
+                f"</tr>\n"
+            )
+        doc += "</tbody></table></div></details>\n"
+
+    doc += "\n</div></body></html>\n"
     html_path.write_text(doc, encoding="utf-8")
     return html_path
+
+
+# -----------------------------
+# Validation framework
+# -----------------------------
+def load_known_sites(path: Path) -> List[Dict[str, Any]]:
+    """
+    Load known archaeological site locations from a CSV or GeoJSON file.
+
+    CSV format (minimum columns required: lat, lon; name is optional):
+        name,lat,lon
+        Structure A,17.123,-89.456
+
+    GeoJSON format: FeatureCollection of Point features.  The 'name'
+    property (or 'id') is used as the site label if present.
+
+    Returns a list of dicts with keys: name (str), lat (float), lon (float).
+    """
+    suffix = path.suffix.lower()
+    sites: List[Dict[str, Any]] = []
+
+    if suffix == ".geojson" or suffix == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        features = data.get("features", [])
+        for i, feat in enumerate(features):
+            geom = feat.get("geometry", {})
+            if geom.get("type") != "Point":
+                continue
+            coords = geom.get("coordinates", [])
+            if len(coords) < 2:
+                continue
+            lon_s, lat_s = float(coords[0]), float(coords[1])
+            props = feat.get("properties") or {}
+            name = str(props.get("name") or props.get("id") or props.get("Name") or f"site_{i+1}")
+            sites.append({"name": name, "lat": lat_s, "lon": lon_s})
+    else:
+        import csv as _csv
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            if reader.fieldnames is None:
+                raise ValueError(f"Empty or header-less CSV: {path}")
+            fields_lower = [h.lower().strip() for h in reader.fieldnames]
+            if "lat" not in fields_lower or "lon" not in fields_lower:
+                raise ValueError(
+                    f"Validation CSV must have 'lat' and 'lon' columns. Found: {list(reader.fieldnames)}"
+                )
+            lat_col = reader.fieldnames[fields_lower.index("lat")]
+            lon_col = reader.fieldnames[fields_lower.index("lon")]
+            name_col = None
+            for candidate_name in ("name", "Name", "NAME", "site", "id"):
+                if candidate_name in reader.fieldnames:
+                    name_col = candidate_name
+                    break
+            for i, row in enumerate(reader):
+                try:
+                    lat_s = float(row[lat_col])
+                    lon_s = float(row[lon_col])
+                except (TypeError, ValueError):
+                    continue
+                name = str(row[name_col]) if name_col and row.get(name_col) else f"site_{i+1}"
+                sites.append({"name": name, "lat": lat_s, "lon": lon_s})
+
+    return sites
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in meters between two WGS84 points."""
+    R = 6_371_000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return 2.0 * R * math.asin(min(1.0, math.sqrt(a)))
+
+
+def validate_candidates(
+    candidates: List[Candidate],
+    known_sites: List[Dict[str, Any]],
+    match_radius_m: float,
+) -> Dict[str, Any]:
+    """
+    For each known site, find the closest candidate within match_radius_m.
+    Returns a dict with hit-rate metrics and per-site results.
+    """
+    sorted_c = sorted(candidates, key=lambda c: c.score, reverse=True)
+    rank_map = {c.cand_id: (rank + 1) for rank, c in enumerate(sorted_c)}
+
+    per_site: List[Dict[str, Any]] = []
+    hits_by_rank: Dict[int, int] = {}
+
+    for site in known_sites:
+        slat, slon = float(site["lat"]), float(site["lon"])
+        best_dist = float("inf")
+        best_cand = None
+        for c in candidates:
+            d = _haversine_m(slat, slon, c.lat, c.lon)
+            if d < best_dist:
+                best_dist = d
+                best_cand = c
+
+        hit = best_cand is not None and best_dist <= match_radius_m
+        rank = rank_map.get(best_cand.cand_id) if best_cand else None
+        per_site.append(
+            {
+                "name": site["name"],
+                "lat": slat,
+                "lon": slon,
+                "hit": hit,
+                "matched_cand_id": best_cand.cand_id if best_cand and hit else None,
+                "matched_rank": rank if hit else None,
+                "dist_m": round(best_dist, 1) if best_cand else None,
+                "matched_score": round(best_cand.score, 4) if best_cand and hit else None,
+            }
+        )
+        if hit and rank is not None:
+            hits_by_rank[rank] = hits_by_rank.get(rank, 0) + 1
+
+    n_sites = len(known_sites)
+    n_hits = sum(1 for s in per_site if s["hit"])
+    recall = float(n_hits) / max(1, n_sites)
+
+    hit_ranks = [s["matched_rank"] for s in per_site if s["hit"] and s["matched_rank"] is not None]
+    mean_rank = float(sum(hit_ranks)) / len(hit_ranks) if hit_ranks else None
+    median_rank = float(sorted(hit_ranks)[len(hit_ranks) // 2]) if hit_ranks else None
+
+    cutoffs = [10, 25, 50, 100]
+    hits_at = {}
+    for k in cutoffs:
+        hits_at[f"hits_top_{k}"] = sum(1 for r in hit_ranks if r <= k) if hit_ranks else 0
+
+    return {
+        "known_sites": n_sites,
+        "hits": n_hits,
+        "recall": round(recall, 4),
+        "match_radius_m": match_radius_m,
+        "mean_rank_of_hits": round(mean_rank, 1) if mean_rank is not None else None,
+        "median_rank_of_hits": median_rank,
+        "total_candidates": len(candidates),
+        **hits_at,
+        "per_site": per_site,
+    }
+
+
+def write_validation_json(results: Dict[str, Any], out_path: Path) -> None:
+    out_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
 
 
 # -----------------------------
@@ -1987,7 +2611,12 @@ def main() -> None:
     ap.add_argument("--runs-dir", default="runs", help="Runs base directory")
     ap.add_argument("--overwrite", action="store_true", help="Allow deleting an existing run folder")
 
+    ap.add_argument("--resolution-m", type=_arg_positive_float, default=None, help="DTM raster resolution in meters (default 1.0)")
     ap.add_argument("--try-smrf", action="store_true", help="Try PDAL SMRF ground classification before DTM")
+    ap.add_argument("--smrf-scalar", type=_arg_positive_float, default=None, help="SMRF scalar parameter — sensitivity to outliers (default 1.25)")
+    ap.add_argument("--smrf-slope", type=_arg_positive_float, default=None, help="SMRF slope tolerance in m/m (default 0.15)")
+    ap.add_argument("--smrf-threshold", type=_arg_positive_float, default=None, help="SMRF initial height threshold in meters (default 0.5)")
+    ap.add_argument("--smrf-window", type=_arg_positive_float, default=None, help="SMRF max window size in meters for ground search (default 16.0)")
 
     # knobs
     ap.add_argument("--pos-thresh", type=_arg_pos_thresh_spec, default=None, help="Override pos relief threshold (e.g. 0.20 or auto:p96)")
@@ -2026,6 +2655,14 @@ def main() -> None:
     ap.add_argument("--min-prominence", type=_arg_nonnegative_float, default=None, help="Min local prominence (m) post-filter (default 0.10)")
     ap.add_argument("--min-compactness", type=_arg_unit_interval, default=None, help="Min compactness 4*pi*A/P^2 (0..1), lower removes line-like shapes")
     ap.add_argument("--min-solidity", type=_arg_unit_interval, default=None, help="Min solidity area/convex_hull_area (0..1), lower removes fragmented/linear shapes")
+    ap.add_argument("--max-peak-offset", type=_arg_nonnegative_float, default=None, help="Max peak_offset_ratio (default 0.60); ridge/slope faces score >0.65, dome-shaped mounds <0.45")
+    ap.add_argument("--tpi-radius-m", type=_arg_positive_float, default=None, help="TPI neighbourhood radius in metres (default 50); larger = coarser regional context")
+    ap.add_argument("--max-tpi", type=_arg_nonnegative_float, default=None, help="Max TPI at candidate centroid (0=disabled); ridge crests >2 m, flat terrain <0.5 m")
+
+    # Depression detection
+    ap.add_argument("--detect-depressions", action="store_true", help="Run a second pipeline pass on inverted LRM to find depressions (plazas, aguadas, quarries)")
+    ap.add_argument("--neg-thresh", type=_arg_pos_thresh_spec, default=None, help="Negative-relief threshold for depression detection (e.g. auto:p96 or 0.20); default auto:p96")
+    ap.add_argument("--min-depression-depth", type=_arg_positive_float, default=None, help="Minimum depression depth in meters (default 0.20)")
 
     # scoring knobs
     ap.add_argument("--score-extent-exp", type=_arg_nonnegative_float, default=None, help="Exponent for extent in score (default 0.35)")
@@ -2044,6 +2681,19 @@ def main() -> None:
 
     # HTML / cutouts
     ap.add_argument("--no-html", action="store_true", help="Disable HTML report + cutout images")
+
+    # Validation
+    ap.add_argument(
+        "--validate-against",
+        default=None,
+        help="Path to CSV (lat,lon,name) or GeoJSON of known archaeological sites for hit-rate validation",
+    )
+    ap.add_argument(
+        "--validate-match-radius-m",
+        type=_arg_positive_float,
+        default=25.0,
+        help="Radius in meters: a candidate within this distance of a known site counts as a hit (default 25)",
+    )
     ap.add_argument("--cutout-size-m", type=_arg_positive_float, default=None, help="Cutout panel window size in meters (default 140)")
     ap.add_argument("--cutout-top-n", type=_arg_nonnegative_int, default=None, help="How many top candidates get cutouts (default report_top_n)")
 
@@ -2057,6 +2707,17 @@ def main() -> None:
         print(f"Run name sanitized: '{args.name}' -> '{run_name}'", file=sys.stderr)
 
     params = Params()
+
+    if args.resolution_m is not None:
+        params.dtm_resolution_m = args.resolution_m
+    if args.smrf_scalar is not None:
+        params.smrf_scalar = args.smrf_scalar
+    if args.smrf_slope is not None:
+        params.smrf_slope = args.smrf_slope
+    if args.smrf_threshold is not None:
+        params.smrf_threshold = args.smrf_threshold
+    if args.smrf_window is not None:
+        params.smrf_window = args.smrf_window
 
     if args.pos_thresh is not None:
         params.pos_relief_threshold_spec = args.pos_thresh
@@ -2099,6 +2760,19 @@ def main() -> None:
         params.min_compactness = args.min_compactness
     if args.min_solidity is not None:
         params.min_solidity = args.min_solidity
+    if args.max_peak_offset is not None:
+        params.max_peak_offset_ratio = args.max_peak_offset
+    if args.tpi_radius_m is not None:
+        params.tpi_radius_m = args.tpi_radius_m
+    if args.max_tpi is not None:
+        params.max_tpi_m = args.max_tpi
+
+    if args.detect_depressions:
+        params.detect_depressions = True
+    if args.neg_thresh is not None:
+        params.neg_relief_threshold_spec = args.neg_thresh
+    if args.min_depression_depth is not None:
+        params.min_depression_depth_m = args.min_depression_depth
 
     if args.score_extent_exp is not None:
         params.score_extent_exp = args.score_extent_exp
@@ -2148,6 +2822,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     setup_logging(out_dir)
+    configure_runtime_cache_dirs(out_dir)
     pdal_ver = pdal_version()
     LOG.info("PDAL detected: %s", pdal_ver)
     run_t0 = time.perf_counter()
@@ -2155,8 +2830,10 @@ def main() -> None:
 
     dtm_path = out_dir / "dtm.tif"
     lrm_path = out_dir / "lrm.tif"
+    tpi_path = out_dir / "tpi.tif"
     density_path = out_dir / "mound_density.tif"
     geojson_path = out_dir / "candidates.geojson"
+    regions_geojson_path = out_dir / "candidate_regions.geojson"
     kml_path = out_dir / "candidates.kml"
     csv_path = out_dir / "candidates.csv"
     clusters_csv = out_dir / "clusters.csv"
@@ -2165,14 +2842,19 @@ def main() -> None:
 
     tmp_dir = out_dir / "_tmp"
 
-    LOG.info("Step 0: Building DTM from LAZ/LAS")
+    LOG.info("Step 0: Point cloud QC + DTM build")
     step_t0 = time.perf_counter()
+    point_density = check_point_cloud_density(input_path, params.dtm_resolution_m)
     build_dtm_from_laz(
         laz_path=input_path,
         out_dtm_tif=dtm_path,
         tmp_dir=tmp_dir,
         resolution_m=params.dtm_resolution_m,
         try_smrf=bool(args.try_smrf),
+        smrf_scalar=params.smrf_scalar,
+        smrf_slope=params.smrf_slope,
+        smrf_threshold=params.smrf_threshold,
+        smrf_window=params.smrf_window,
     )
     stage_metrics["step0_dtm_sec"] = float(time.perf_counter() - step_t0)
     LOG.info("DTM written: %s", dtm_path)
@@ -2183,9 +2865,31 @@ def main() -> None:
     dtm_transform = dtm_prof["transform"]
     res_m = _res_m_from_profile(dtm_prof)
 
+    valid_pix, total_pix, dtm_coverage = check_dtm_coverage(dtm)
+    LOG.info(
+        "DTM coverage: %d / %d valid pixels (%.1f%%)",
+        valid_pix, total_pix, dtm_coverage * 100.0,
+    )
+    if dtm_coverage < 0.05:
+        raise RuntimeError(
+            f"DTM has only {dtm_coverage * 100:.1f}% valid pixels — ground classification likely "
+            "failed or the tile has too few ground returns. "
+            "Try --try-smrf, inspect the point cloud, or check that the input has Class 2 returns."
+        )
+    if dtm_coverage < 0.70:
+        msg = (
+            f"DTM coverage is low ({dtm_coverage * 100:.1f}% valid pixels). "
+            "Results may be unreliable in data-sparse areas."
+        )
+        LOG.warning(msg)
+        print(f"WARNING: {msg}", file=sys.stderr)
+
     slope_deg = compute_slope_degrees(dtm, res_m=float(res_m))
+    tpi = compute_tpi(dtm, radius_m=float(params.tpi_radius_m), res_m=float(res_m))
+    write_float_geotiff(tpi_path, tpi, dtm_prof, nodata=float("nan"))
+    LOG.info("TPI written: %s  (radius=%.0f m)", tpi_path, params.tpi_radius_m)
     lrm = build_multiscale_lrm(dtm, params)
-    write_float_geotiff(lrm_path, lrm, dtm_prof)
+    write_float_geotiff(lrm_path, lrm, dtm_prof, nodata=float("nan"))
     stage_metrics["step1_lrm_sec"] = float(time.perf_counter() - step_t0)
     LOG.info("LRM written: %s", lrm_path)
 
@@ -2212,6 +2916,7 @@ def main() -> None:
         raise RuntimeError("DTM has no CRS; cannot export lon/lat")
     src_crs = CRS.from_user_input(crs_any)
     transformer_ll = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
+    _check_utm_zone_boundary(dtm, dtm_prof, src_crs)
 
     # Candidate build + filters
     candidates: List[Candidate] = []
@@ -2230,7 +2935,10 @@ def main() -> None:
             y0 = int(r.get("y0", 0))
             x1 = int(r.get("x1", W - 1))
             y1 = int(r.get("y1", H - 1))
-            if x0 <= edge_buffer_pix or y0 <= edge_buffer_pix or x1 >= (W - 1 - edge_buffer_pix) or y1 >= (H - 1 - edge_buffer_pix):
+            # Strict inequalities: a bbox touching exactly the buffer boundary is
+            # kept; only bboxes whose extent reaches into the buffer zone are dropped.
+            # Using <= / >= would exclude one extra pixel layer beyond edge_buffer_m.
+            if x0 < edge_buffer_pix or y0 < edge_buffer_pix or x1 > (W - 1 - edge_buffer_pix) or y1 > (H - 1 - edge_buffer_pix):
                 dropped_edge += 1
                 continue
 
@@ -2250,8 +2958,13 @@ def main() -> None:
         prominence = float(r.get("prominence_m", 0.0))
         compactness = float(r.get("compactness", 0.0))
         solidity = float(r.get("solidity", 0.0))
+        peak_offset_ratio = float(r.get("peak_offset_ratio", 0.0))
 
-        # post-filters for “project goal”
+        tpi_row = max(0, min(tpi.shape[0] - 1, int(round(float(r["cy"])))))
+        tpi_col = max(0, min(tpi.shape[1] - 1, int(round(float(r["cx"])))))
+        tpi_val = float(tpi[tpi_row, tpi_col])
+
+        # post-filters for "project goal"
         if (
             peak < params.min_peak_relief_m
             or area_m2 < params.min_area_m2
@@ -2261,19 +2974,21 @@ def main() -> None:
             or prominence < params.min_prominence_m
             or compactness < params.min_compactness
             or solidity < params.min_solidity
+            or (params.max_peak_offset_ratio > 0.0 and peak_offset_ratio > params.max_peak_offset_ratio)
+            or (params.max_tpi_m > 0.0 and np.isfinite(tpi_val) and tpi_val > params.max_tpi_m)
         ):
             dropped_post += 1
             continue
 
         score = (
-            (dens ** params.score_density_exp)
-            * (max(1e-9, peak) ** params.score_peak_exp)
-            * ((max(1e-6, extent)) ** params.score_extent_exp)
-            * ((max(1.0, float(consensus_support))) ** params.score_consensus_exp)
-            * ((max(1e-6, prominence)) ** params.score_prominence_exp)
-            * ((max(1e-6, compactness)) ** params.score_compactness_exp)
-            * ((max(1e-6, solidity)) ** params.score_solidity_exp)
-            * (max(1e-9, area_m2) ** params.score_area_exp)
+            (max(_SCORE_FLOOR_DENSITY, dens) ** params.score_density_exp)
+            * (max(_SCORE_FLOOR_PEAK, peak) ** params.score_peak_exp)
+            * (max(_SCORE_FLOOR_EXTENT, extent) ** params.score_extent_exp)
+            * (max(_SCORE_FLOOR_CONSENSUS, float(consensus_support)) ** params.score_consensus_exp)
+            * (max(_SCORE_FLOOR_PROMINENCE, prominence) ** params.score_prominence_exp)
+            * (max(_SCORE_FLOOR_COMPACTNESS, compactness) ** params.score_compactness_exp)
+            * (max(_SCORE_FLOOR_SOLIDITY, solidity) ** params.score_solidity_exp)
+            * (max(_SCORE_FLOOR_AREA, area_m2) ** params.score_area_exp)
         )
 
         x_map, y_map = pix2map_xy(dtm_transform, r["cy"], r["cx"])
@@ -2294,11 +3009,16 @@ def main() -> None:
                 prominence_m=prominence,
                 compactness=compactness,
                 solidity=solidity,
+                peak_offset_ratio=peak_offset_ratio,
                 width_m=float(r["width_m"]),
                 height_m=float(r["height_m"]),
                 score=float(score),
                 lon=float(lon),
                 lat=float(lat),
+                bbox_px_x0=int(r["x0"]),
+                bbox_px_y0=int(r["y0"]),
+                bbox_px_x1=int(r["x1"]),
+                bbox_px_y1=int(r["y1"]),
             )
         )
         cand_id += 1
@@ -2320,13 +3040,111 @@ def main() -> None:
     LOG.info("Dropped by spacing de-dup (%.1f m): %d", params.min_candidate_spacing_m, dropped_spacing)
     LOG.info("Kept candidates after density + post-filters: %d", len(candidates))
 
+    if params.detect_depressions:
+        LOG.info("Step 2b: Depression detection pass (inverted LRM)")
+        neg_lrm = np.where(np.isfinite(lrm), -lrm, np.nan)
+        dep_params = replace(
+            params,
+            pos_relief_threshold_spec=params.neg_relief_threshold_spec,
+            min_peak_relief_m=params.min_depression_depth_m,
+            min_density_spec="0",
+            consensus_enabled=False,
+        )
+        dep_regions, _, _, _, _ = detect_candidates(
+            lrm=neg_lrm,
+            dtm_slope_deg=slope_deg,
+            profile=dtm_prof,
+            params=dep_params,
+            out_density_tif=out_dir / "depression_density.tif",
+        )
+        dep_dropped = 0
+        dep_added_before = len(candidates)
+        for r in dep_regions:
+            if edge_buffer_pix > 0:
+                x0 = int(r.get("x0", 0))
+                y0 = int(r.get("y0", 0))
+                x1 = int(r.get("x1", W - 1))
+                y1 = int(r.get("y1", H - 1))
+                if x0 < edge_buffer_pix or y0 < edge_buffer_pix or x1 > (W - 1 - edge_buffer_pix) or y1 > (H - 1 - edge_buffer_pix):
+                    dep_dropped += 1
+                    continue
+
+            peak = float(r["peak"])
+            area_m2 = float(r["area_m2"])
+            extent = float(r["extent"])
+            aspect = float(r["aspect"])
+            prominence = float(r.get("prominence_m", 0.0))
+            compactness = float(r.get("compactness", 0.0))
+            solidity = float(r.get("solidity", 0.0))
+            peak_offset_ratio = float(r.get("peak_offset_ratio", 0.0))
+
+            if (
+                peak < dep_params.min_peak_relief_m
+                or area_m2 < dep_params.min_area_m2
+                or (dep_params.max_area_m2 > 0.0 and area_m2 > dep_params.max_area_m2)
+                or extent < dep_params.min_extent
+                or aspect > dep_params.max_aspect
+                or prominence < dep_params.min_prominence_m
+                or compactness < dep_params.min_compactness
+                or solidity < dep_params.min_solidity
+            ):
+                dep_dropped += 1
+                continue
+
+            x_map, y_map = pix2map_xy(dtm_transform, r["cy"], r["cx"])
+            lon, lat = transformer_ll.transform(x_map, y_map)
+
+            dep_score = (
+                (max(_SCORE_FLOOR_PEAK, peak) ** dep_params.score_peak_exp)
+                * (max(_SCORE_FLOOR_PROMINENCE, prominence) ** dep_params.score_prominence_exp)
+                * (max(_SCORE_FLOOR_COMPACTNESS, compactness) ** dep_params.score_compactness_exp)
+                * (max(_SCORE_FLOOR_SOLIDITY, solidity) ** dep_params.score_solidity_exp)
+                * (max(_SCORE_FLOOR_AREA, area_m2) ** dep_params.score_area_exp)
+            )
+
+            candidates.append(
+                Candidate(
+                    cand_id=cand_id,
+                    px_x=float(r["cx"]),
+                    px_y=float(r["cy"]),
+                    peak_relief_m=peak,
+                    mean_relief_m=float(r["mean"]),
+                    area_m2=area_m2,
+                    density=float(r.get("density_mean", 0.0)),
+                    extent=extent,
+                    aspect=aspect,
+                    consensus_support=1,
+                    prominence_m=prominence,
+                    compactness=compactness,
+                    solidity=solidity,
+                    peak_offset_ratio=peak_offset_ratio,
+                    width_m=float(r["width_m"]),
+                    height_m=float(r["height_m"]),
+                    score=float(dep_score),
+                    lon=float(lon),
+                    lat=float(lat),
+                    cluster_id=-1,
+                    feature_type="depression",
+                    bbox_px_x0=int(r["x0"]),
+                    bbox_px_y0=int(r["y0"]),
+                    bbox_px_x1=int(r["x1"]),
+                    bbox_px_y1=int(r["y1"]),
+                )
+            )
+            cand_id += 1
+
+        dep_added = len(candidates) - dep_added_before
+        LOG.info("Depression candidates added: %d (dropped edge/shape: %d)", dep_added, dep_dropped)
+
     LOG.info("Step 3: Clustering + settlement pattern analysis (meters)")
     step_t0 = time.perf_counter()
     used_m_crs: Optional[CRS] = None
-    if candidates:
+    mound_cands = [c for c in candidates if c.feature_type == "mound"]
+    dep_cands = [c for c in candidates if c.feature_type == "depression"]
+    if mound_cands:
         xs = []
         ys = []
-        for c in candidates:
+        for c in mound_cands:
             x_map, y_map = pix2map_xy(dtm_transform, c.px_y, c.px_x)
             xs.append(float(x_map))
             ys.append(float(y_map))
@@ -2337,19 +3155,48 @@ def main() -> None:
         LOG.info("Clustering CRS: %s", used_m_crs.to_string())
 
         labels = cluster_candidates_meters(xs_m, ys_m, params)
-        for c, lab in zip(candidates, labels):
+        for c, lab in zip(mound_cands, labels):
             c.cluster_id = int(lab)
 
-        assign_cluster_core_distances(candidates, xs_m, ys_m)
+        assign_cluster_core_distances(mound_cands, xs_m, ys_m)
 
-        n_clusters = len({c.cluster_id for c in candidates if c.cluster_id != -1})
-        LOG.info("Clusters found: %d (noise=%d)", n_clusters, sum(1 for c in candidates if c.cluster_id == -1))
+        n_clusters = len({c.cluster_id for c in mound_cands if c.cluster_id != -1})
+        LOG.info("Clusters found: %d (noise=%d)", n_clusters, sum(1 for c in mound_cands if c.cluster_id == -1))
+    candidates = mound_cands + dep_cands
     stage_metrics["step3_cluster_sec"] = float(time.perf_counter() - step_t0)
+
+    # Validation against known site locations
+    validation_results: Optional[Dict[str, Any]] = None
+    if args.validate_against is not None:
+        val_path = Path(args.validate_against).expanduser().resolve()
+        LOG.info("Step 3b: Validating against known sites: %s", val_path)
+        try:
+            known_sites = load_known_sites(val_path)
+            LOG.info("Loaded %d known site locations", len(known_sites))
+            validation_results = validate_candidates(
+                candidates, known_sites, match_radius_m=float(args.validate_match_radius_m)
+            )
+            val_json_path = out_dir / "validation_results.json"
+            write_validation_json(validation_results, val_json_path)
+            LOG.info(
+                "Validation: %d/%d known sites hit (recall=%.1f%%) | mean rank of hits=%.1f | written: %s",
+                int(validation_results["hits"]),
+                int(validation_results["known_sites"]),
+                float(validation_results["recall"]) * 100.0,
+                float(validation_results["mean_rank_of_hits"] or 0),
+                val_json_path,
+            )
+        except Exception as exc:
+            LOG.warning("Validation failed: %s", exc)
+            print(f"WARNING: validation failed: {exc}", file=sys.stderr)
 
     LOG.info("Step 4: Exporting GIS products")
     step_t0 = time.perf_counter()
     write_geojson(candidates, geojson_path)
-    LOG.info("Wrote GeoJSON: %s", geojson_path)
+    LOG.info("Wrote GeoJSON (centroids): %s", geojson_path)
+
+    write_regions_geojson(candidates, dtm_transform, transformer_ll, regions_geojson_path)
+    LOG.info("Wrote GeoJSON (region polygons): %s", regions_geojson_path)
 
     write_kml(candidates, kml_path, label_top_n=params.kml_label_top_n)
     LOG.info("Wrote KML: %s", kml_path)
@@ -2388,20 +3235,21 @@ def main() -> None:
         LOG.info("Wrote report.pdf: %s", report_pdf)
     stage_metrics["step6_reports_sec"] = float(time.perf_counter() - step_t0)
 
-    if params.html_report and candidates:
+    if params.html_report:
         cutout_top_n = params.report_top_n if args.cutout_top_n is None else int(args.cutout_top_n)
         LOG.info("Step 7: Generating HTML report + cutouts")
         step_t0 = time.perf_counter()
-        generate_candidate_panels(
-            out_dir=out_dir,
-            run_name=run_name,
-            dtm=dtm,
-            lrm=lrm,
-            params=params,
-            candidates=candidates,
-            top_n=cutout_top_n,
-            res_m=float(res_m),
-        )
+        if candidates:
+            generate_candidate_panels(
+                out_dir=out_dir,
+                run_name=run_name,
+                dtm=dtm,
+                lrm=lrm,
+                params=params,
+                candidates=candidates,
+                top_n=cutout_top_n,
+                res_m=float(res_m),
+            )
         html_out = write_html_report(
             out_dir=out_dir,
             run_name=run_name,
@@ -2410,6 +3258,7 @@ def main() -> None:
             params=params,
             pos_thresh=pos_thresh,
             min_density=min_density,
+            validation_results=validation_results,
         )
         LOG.info("Wrote report.html: %s", html_out)
         stage_metrics["step7_html_sec"] = float(time.perf_counter() - step_t0)
@@ -2432,6 +3281,8 @@ def main() -> None:
         dropped_spacing=dropped_spacing,
         candidate_count=len(candidates),
         stage_metrics=stage_metrics,
+        dtm_coverage=dtm_coverage,
+        point_density=point_density,
     )
     LOG.info("Wrote run_params.json: %s", params_json)
 
